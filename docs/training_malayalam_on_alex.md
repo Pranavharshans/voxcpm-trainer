@@ -6,11 +6,13 @@ the actual tokenization statistics, and run LoRA adaptation on both the
 text-semantic LM and DiT.
 
 The pilot dataset is `Praha-Labs/TTS-Ml`. Its public `train` split contains
-71,608 examples with 16 kHz audio and Malayalam text. The preparation job uses
-streaming mode, a fixed seed, and a bounded shuffle buffer to stop after 20,000
-accepted examples. It writes 19,500 training examples and 500 validation
-examples as FLAC plus VoxCPM JSONL manifests; it does not download or unpack the
-complete dataset. The dataset revision is pinned for reproducibility.
+71,608 examples with Malayalam text and mixed source audio rates. The
+preparation job uses streaming mode, resamples accepted audio to VoxCPM's
+required 16 kHz rate, and applies a fixed seed and bounded shuffle buffer before
+stopping at 20,000 accepted examples. It writes 19,500 training examples and
+500 validation examples as FLAC plus VoxCPM JSONL manifests; it does not
+download or unpack the complete dataset. The dataset revision is pinned for
+reproducibility.
 
 ## Why “tokenizer-free” does not remove the text tokenizer
 

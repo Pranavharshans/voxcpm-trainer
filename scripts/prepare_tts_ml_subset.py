@@ -8,33 +8,26 @@ import io
 import json
 import sys
 import unicodedata
+from math import gcd
 from pathlib import Path
 
 import numpy as np
 import soundfile as sf
 from datasets import Audio, load_dataset
+from scipy.signal import resample_poly
 
 
 DATASET_ID = "Praha-Labs/TTS-Ml"
 DATASET_REVISION = "33cef946925f89ee48511951da3049f5281cfd2e"
 SAMPLE_RATE = 16_000
+PREPARATION_VERSION = 2
 
 
 def _is_malayalam(text: str) -> bool:
     return any("\u0d00" <= char <= "\u0d7f" for char in text)
 
 
-def _valid_existing_audio(path: Path) -> bool:
-    if not path.is_file():
-        return False
-    try:
-        info = sf.info(path)
-        return info.frames > 0 and info.samplerate == SAMPLE_RATE and info.channels == 1
-    except Exception:
-        return False
-
-
-def _extract_audio(row: dict) -> np.ndarray:
+def _extract_audio(row: dict) -> tuple[np.ndarray, int]:
     audio = row.get("audio")
     if not isinstance(audio, dict):
         raise ValueError("row does not contain an audio object")
@@ -49,9 +42,6 @@ def _extract_audio(row: dict) -> np.ndarray:
     else:
         raise ValueError("audio object has neither bytes, path, nor decoded samples")
 
-    if sampling_rate != SAMPLE_RATE:
-        raise ValueError(f"expected {SAMPLE_RATE} Hz audio, got {sampling_rate} Hz")
-
     samples = np.asarray(samples, dtype=np.float32)
     if samples.ndim == 2:
         samples = samples.mean(axis=0 if samples.shape[0] <= 2 else 1)
@@ -59,7 +49,21 @@ def _extract_audio(row: dict) -> np.ndarray:
         raise ValueError(f"expected non-empty mono audio, got shape {samples.shape}")
     if not np.isfinite(samples).all():
         raise ValueError("audio contains NaN or infinite values")
-    return samples
+    if sampling_rate <= 0:
+        raise ValueError(f"invalid source sampling rate: {sampling_rate}")
+
+    source_sampling_rate = int(sampling_rate)
+    if source_sampling_rate != SAMPLE_RATE:
+        divisor = gcd(source_sampling_rate, SAMPLE_RATE)
+        samples = resample_poly(
+            samples,
+            up=SAMPLE_RATE // divisor,
+            down=source_sampling_rate // divisor,
+        ).astype(np.float32, copy=False)
+        if samples.size == 0 or not np.isfinite(samples).all():
+            raise ValueError(f"resampling from {source_sampling_rate} Hz produced invalid audio")
+
+    return samples, source_sampling_rate
 
 
 def main() -> int:
@@ -90,7 +94,8 @@ def main() -> int:
     if completion.is_file():
         metadata = json.loads(completion.read_text(encoding="utf-8"))
         if (
-            metadata.get("dataset") == DATASET_ID
+            metadata.get("preparation_version") == PREPARATION_VERSION
+            and metadata.get("dataset") == DATASET_ID
             and metadata.get("dataset_revision") == DATASET_REVISION
             and metadata.get("total_samples") == args.total_samples
             and metadata.get("validation_samples") == args.validation_samples
@@ -114,6 +119,7 @@ def main() -> int:
     val_tmp = output_dir / "val.jsonl.tmp"
     accepted = 0
     skipped = 0
+    resampled = 0
     source_rows_seen = 0
 
     with train_tmp.open("w", encoding="utf-8") as train_handle, val_tmp.open("w", encoding="utf-8") as val_handle:
@@ -128,20 +134,25 @@ def main() -> int:
                 text = unicodedata.normalize("NFC", text.strip())
                 if not _is_malayalam(text):
                     raise ValueError("transcript has no Malayalam code points")
-                samples = _extract_audio(row)
+                samples, source_sampling_rate = _extract_audio(row)
             except Exception as exc:
                 skipped += 1
                 if skipped <= 20:
                     print(f"Skipping source row {source_rows_seen}: {exc}", file=sys.stderr)
                 continue
 
+            if source_sampling_rate != SAMPLE_RATE:
+                resampled += 1
+
             shard_dir = audio_root / f"{accepted // 1000:03d}"
             shard_dir.mkdir(parents=True, exist_ok=True)
             audio_path = shard_dir / f"{accepted:06d}.flac"
-            if not _valid_existing_audio(audio_path):
-                temp_audio = audio_path.with_suffix(".flac.tmp")
-                sf.write(temp_audio, samples, SAMPLE_RATE, format="FLAC", subtype="PCM_16")
-                temp_audio.replace(audio_path)
+            # Always rewrite partial output. A previous interrupted run may
+            # have used different acceptance or resampling logic, in which
+            # case reusing a numbered file could pair it with the wrong text.
+            temp_audio = audio_path.with_suffix(".flac.tmp")
+            sf.write(temp_audio, samples, SAMPLE_RATE, format="FLAC", subtype="PCM_16")
+            temp_audio.replace(audio_path)
 
             manifest_row = {
                 "audio": str(audio_path),
@@ -153,7 +164,7 @@ def main() -> int:
             accepted += 1
 
             if accepted % 1_000 == 0:
-                print(f"Prepared {accepted}/{args.total_samples} samples")
+                print(f"Prepared {accepted}/{args.total_samples} samples (resampled={resampled})")
 
     if accepted != args.total_samples:
         raise RuntimeError(
@@ -164,6 +175,7 @@ def main() -> int:
     train_tmp.replace(final_train)
     val_tmp.replace(final_val)
     metadata = {
+        "preparation_version": PREPARATION_VERSION,
         "dataset": DATASET_ID,
         "dataset_revision": DATASET_REVISION,
         "split": "train",
@@ -175,6 +187,7 @@ def main() -> int:
         "shuffle_buffer": args.shuffle_buffer,
         "source_rows_seen": source_rows_seen,
         "skipped_rows": skipped,
+        "resampled_rows": resampled,
     }
     completion.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(metadata, indent=2))

@@ -25,6 +25,17 @@ JOB_ENV=${RUNTIME_ROOT}/alex.env
 
 module load python
 
+# Alex compute nodes require the cluster proxy for external package/model/data
+# downloads. The Python module's default Conda package cache is under /apps and
+# is read-only, so force it into this project's writable runtime directory.
+ALEX_PROXY_URL=${ALEX_PROXY_URL:-http://proxy.nhr.fau.de:80}
+export http_proxy=${http_proxy:-${ALEX_PROXY_URL}}
+export https_proxy=${https_proxy:-${ALEX_PROXY_URL}}
+export HTTP_PROXY=${HTTP_PROXY:-${ALEX_PROXY_URL}}
+export HTTPS_PROXY=${HTTPS_PROXY:-${ALEX_PROXY_URL}}
+export CONDA_PKGS_DIRS=${RUNTIME_ROOT}/cache/conda-pkgs
+mkdir -p "${CONDA_PKGS_DIRS}"
+
 if [[ ! -x "${CONDA_ENV}/bin/python" ]]; then
     mkdir -p "$(dirname "${CONDA_ENV}")"
     conda create --prefix "${CONDA_ENV}" python=3.11 -y

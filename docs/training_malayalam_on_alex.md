@@ -65,7 +65,7 @@ the values used for this project:
 CLONE_JOB=$(sbatch --parsable \
   --partition=a100mig --ntasks=1 --cpus-per-task=1 --time=00:30:00 \
   --job-name=voxcpm-clone --output="$WORK/voxcpm-clone-%j.out" \
-  --wrap='set -euo pipefail; mkdir -p "$WORK/projects"; git clone --branch main --single-branch https://github.com/Pranavharshans/cosyvoice3-trainer.git "$WORK/projects/vox-trainer"')
+  --wrap='set -euo pipefail; mkdir -p "$WORK/projects"; git clone --branch main --single-branch https://github.com/Pranavharshans/voxcpm-trainer.git "$WORK/projects/vox-trainer"')
 echo "$CLONE_JOB"
 ```
 

@@ -39,6 +39,7 @@ from voxcpm.training import (
     build_dataloader,
     load_audio_text_datasets,
 )
+from voxcpm.training.text import normalize_training_text
 
 
 @argbind.bind(without_prefix=True)
@@ -66,6 +67,7 @@ def train(
     lora: dict = None,
     config_path: str = "",
     max_grad_norm: float = 0.0,  # gradient clipping; 0 = disabled (backward compat)
+    text_normalization: str = "NFC",
     # Distribution options (for LoRA checkpoints)
     hf_model_id: str = "",  # HuggingFace model ID (e.g., "openbmb/VoxCPM1.5")
     distribute: bool = False,  # If True, save hf_model_id as base_model; otherwise save pretrained_path
@@ -116,14 +118,14 @@ def train(
 
     def tokenize(batch):
         text_list = batch["text"]
-        text_ids = [tokenizer(text) for text in text_list]
+        text_ids = [tokenizer(normalize_training_text(text, text_normalization)) for text in text_list]
         return {"text_ids": text_ids}
 
     train_ds = train_ds.map(tokenize, batched=True, remove_columns=["text"])
     # Save original validation texts for audio generation display
     val_texts = None
     if val_ds is not None:
-        val_texts = list(val_ds["text"])  # Save original texts
+        val_texts = [normalize_training_text(text, text_normalization) for text in val_ds["text"]]
         val_ds = val_ds.map(tokenize, batched=True, remove_columns=["text"])
 
     dataset_cnt = int(max(train_ds["dataset_id"])) + 1 if "dataset_id" in train_ds.column_names else 1

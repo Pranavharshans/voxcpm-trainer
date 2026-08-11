@@ -5,3 +5,5 @@ voxcpm.egg-info
 .DS_Store
 ./pretrained_models/
 app_local.py
+conf/slurm/*.env
+!conf/slurm/*.env.example

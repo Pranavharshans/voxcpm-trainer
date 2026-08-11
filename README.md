@@ -601,6 +601,8 @@ python lora_ft_webui.py   # then open http://localhost:7860
 
 > **Full guide →** [Fine-tuning Guide](https://voxcpm.readthedocs.io/en/latest/finetuning/finetune.html) (data preparation, configuration, training, LoRA hot-swapping, FAQ)
 
+> **Malayalam on FAU Alex →** [Cluster training guide](docs/training_malayalam_on_alex.md)
+
 ---
 
 ## 📚 Documentation

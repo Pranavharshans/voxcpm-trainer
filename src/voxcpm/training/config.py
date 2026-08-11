@@ -1,9 +1,32 @@
 from __future__ import annotations
 
-import argbind
-import yaml
+import os
+import re
 from pathlib import Path
 from typing import Dict, Any
+
+import argbind
+import yaml
+
+
+_ENV_VAR_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _expand_environment_variables(value: Any) -> Any:
+    """Recursively expand environment placeholders and reject missing values."""
+
+    if isinstance(value, dict):
+        return {key: _expand_environment_variables(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_expand_environment_variables(item) for item in value]
+    if not isinstance(value, str):
+        return value
+
+    missing = sorted({name for name in _ENV_VAR_PATTERN.findall(value) if name not in os.environ})
+    if missing:
+        names = ", ".join(missing)
+        raise ValueError(f"Missing environment variable(s) required by training config: {names}")
+    return _ENV_VAR_PATTERN.sub(lambda match: os.environ[match.group(1)], value)
 
 
 def load_yaml_config(path: str | Path) -> Dict[str, Any]:
@@ -15,7 +38,7 @@ def load_yaml_config(path: str | Path) -> Dict[str, Any]:
         data = yaml.safe_load(f)
     if not isinstance(data, dict):
         raise ValueError(f"Configuration file {path} must contain a top-level mapping.")
-    return data
+    return _expand_environment_variables(data)
 
 
 def parse_args_with_config(config_path: str | Path | None = None):

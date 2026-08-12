@@ -27,6 +27,7 @@ case "${PROFILE}" in
         JOB_ENV=${RUNTIME_ROOT}/alex.env
         TRAIN_CONFIG=conf/voxcpm_v2/voxcpm_finetune_malayalam_lora.yaml
         DATASET_ARGS=(--total-samples 20000)
+        STAGE_MODEL_TO_TMPDIR=0
         ;;
     full)
         DATA_DIR=${RUNTIME_ROOT}/datasets/tts-ml-full
@@ -34,6 +35,7 @@ case "${PROFILE}" in
         JOB_ENV=${RUNTIME_ROOT}/alex-full.env
         TRAIN_CONFIG=conf/voxcpm_v2/voxcpm_finetune_malayalam_full_3epoch_lora.yaml
         DATASET_ARGS=(--all-samples)
+        STAGE_MODEL_TO_TMPDIR=0
         ;;
     sft)
         DATA_DIR=${RUNTIME_ROOT}/datasets/tts-ml-full
@@ -41,6 +43,7 @@ case "${PROFILE}" in
         JOB_ENV=${RUNTIME_ROOT}/alex-sft.env
         TRAIN_CONFIG=conf/voxcpm_v2/voxcpm_finetune_malayalam_full_sft_2epoch.yaml
         DATASET_ARGS=(--all-samples)
+        STAGE_MODEL_TO_TMPDIR=1
         ;;
     *)
         echo "Unknown profile '${PROFILE}'; expected pilot, full, or sft" >&2
@@ -99,6 +102,7 @@ MALAYALAM_TRAIN_MANIFEST=${DATA_DIR}/train.jsonl
 MALAYALAM_VAL_MANIFEST=${DATA_DIR}/val.jsonl
 VOXCPM_RUN_DIR=${RUN_DIR}
 VOXCPM_TRAIN_CONFIG=${TRAIN_CONFIG}
+VOXCPM_STAGE_MODEL_TO_TMPDIR=${STAGE_MODEL_TO_TMPDIR}
 HF_HOME=${RUNTIME_ROOT}/huggingface-cache
 EOF
 

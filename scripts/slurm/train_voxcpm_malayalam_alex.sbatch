@@ -44,6 +44,20 @@ require_var VOXCPM_RUN_DIR
 module load "${VOXCPM_PYTHON_MODULE:-python}"
 conda activate "${VOXCPM_CONDA_ENV}"
 
+# Loading the multi-gigabyte safetensors file through mmap can be extremely
+# slow when the shared /anvme filesystem is congested. Full SFT profiles can
+# opt into one sequential copy to node-local storage, after which model loading
+# and page faults are served from the compute node's NVMe SSD.
+if [[ "${VOXCPM_STAGE_MODEL_TO_TMPDIR:-0}" == "1" ]]; then
+    STAGED_MODEL_DIR=${TMPDIR}/VoxCPM2
+    mkdir -p "${STAGED_MODEL_DIR}"
+    echo "Staging VoxCPM2 model to node-local storage: ${STAGED_MODEL_DIR}"
+    rsync -a --info=progress2 "${VOXCPM_PRETRAINED_PATH}/" "${STAGED_MODEL_DIR}/"
+    VOXCPM_PRETRAINED_PATH=${STAGED_MODEL_DIR}
+    export VOXCPM_PRETRAINED_PATH
+    echo "Node-local model staging complete."
+fi
+
 cd "${VOXCPM_REPO_DIR}"
 mkdir -p "${VOXCPM_RUN_DIR}"
 

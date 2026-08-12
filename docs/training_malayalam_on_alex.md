@@ -273,6 +273,13 @@ srun --jobid="$SFT_JOB" --overlap --ntasks=1 --cpus-per-task=1 \
   --format=csv
 ```
 
+The generated SFT environment enables `VOXCPM_STAGE_MODEL_TO_TMPDIR=1`.
+At job startup, the launcher sequentially copies the approximately 5 GB base
+model from shared `/anvme` storage into the allocation's node-local `$TMPDIR`.
+This avoids prolonged safetensors mmap page faults on a congested shared
+filesystem. The staged copy is temporary and is deleted automatically when the
+Slurm job ends; the persistent source model is unchanged.
+
 SFT outputs are kept under:
 
 ```text

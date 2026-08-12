@@ -146,3 +146,72 @@ job again resumes from that checkpoint automatically.
 The template intentionally supports one node. Alex multi-node jobs require
 project-level enablement from NHR@FAU support and a separate rendezvous-aware
 launch configuration.
+
+## Full dataset, three-epoch run
+
+After the pilot, use the `full` preparation profile for a fresh run from the
+released VoxCPM2 base model. It consumes the complete pinned `Praha-Labs/TTS-Ml`
+split, retains 500 fixed validation rows, resamples valid audio to 16 kHz, and
+writes a separate `alex-full.env`. The pilot data, logs, and checkpoints are
+not overwritten.
+
+The full configuration derives its optimizer-step count from the number of
+training rows that remain after audio/text validation and length filtering.
+It runs three passes with an effective batch of 16, a 500-step warmup, and a
+lower peak learning rate of `5e-5`. Validation and checkpointing occur at each
+epoch boundary. Four fixed held-out samples are generated at every boundary
+and saved both to TensorBoard and as ordinary WAV files.
+
+From the login node, update the NVMe repository and only submit/inspect jobs:
+
+```bash
+VOX_STORAGE=$(ws_find voxcpm-ml)
+git -C "$VOX_STORAGE/vox-trainer" pull --ff-only origin main
+
+PREP_JOB=$(sbatch --parsable \
+  --output="$VOX_STORAGE/voxcpm-full-prep-%j.out" \
+  "$VOX_STORAGE/vox-trainer/scripts/slurm/prepare_voxcpm_malayalam_alex.sbatch" \
+  "$VOX_STORAGE/vox-trainer" \
+  "$VOX_STORAGE/voxcpm-runtime" \
+  full)
+
+TRAIN_JOB=$(sbatch --parsable \
+  --partition=a100 \
+  --gres=gpu:a100:1 \
+  --constraint=a100_80 \
+  --cpus-per-task=16 \
+  --dependency="afterok:$PREP_JOB" \
+  --output="$VOX_STORAGE/voxcpm-full-train-%j.out" \
+  "$VOX_STORAGE/vox-trainer/scripts/slurm/train_voxcpm_malayalam_alex.sbatch" \
+  "$VOX_STORAGE/voxcpm-runtime/alex-full.env")
+
+echo "Preparation: $PREP_JOB"
+echo "Training: $TRAIN_JOB"
+```
+
+Monitor both jobs without running preparation or training on the login node:
+
+```bash
+watch -n 10 "squeue -j $PREP_JOB,$TRAIN_JOB -o '%.18i %.12P %.18j %.2t %.10M %.10l %R'"
+tail --retry -F \
+  "$VOX_STORAGE/voxcpm-full-prep-$PREP_JOB.out" \
+  "$VOX_STORAGE/voxcpm-full-train-$TRAIN_JOB.out"
+```
+
+The outputs are kept under:
+
+```text
+voxcpm-runtime/runs/malayalam-full-3epoch/
+├── checkpoints/epoch_01/
+├── checkpoints/epoch_02/
+├── checkpoints/epoch_03/
+├── eval_samples/epoch_01/
+├── eval_samples/epoch_02/
+├── eval_samples/epoch_03/
+└── tensorboard/
+```
+
+Each evaluation directory contains the generated WAV, reference WAV, and
+Malayalam transcript for each fixed sample. These are zero-shot generations;
+the reference recording is included for comparison and is not supplied to the
+model as a voice prompt.

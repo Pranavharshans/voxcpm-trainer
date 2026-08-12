@@ -243,6 +243,7 @@ def build_dataloader(
     batch_size: int,
     num_workers: int,
     drop_last: bool = False,
+    shuffle: bool = True,
 ) -> torch.utils.data.DataLoader:
     torch_dataset = HFVoxCPMDataset(hf_dataset)
     # Standard padding-based batching; Accelerator will attach DistributedSampler if needed.
@@ -250,7 +251,7 @@ def build_dataloader(
         torch_dataset,
         batch_size=batch_size,
         num_workers=num_workers,
-        shuffle=True,
+        shuffle=shuffle,
         collate_fn=HFVoxCPMDataset.collate_fn,
         drop_last=drop_last,
     )

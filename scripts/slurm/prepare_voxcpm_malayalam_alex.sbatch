@@ -3,15 +3,16 @@
 #SBATCH --partition=a100mig
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --time=06:00:00
+#SBATCH --time=10:00:00
 #SBATCH --export=NONE
 #SBATCH --output=slurm-%x-%j.out
 
 set -euo pipefail
 unset SLURM_EXPORT_ENV
 
-REPO_DIR=${1:?"usage: sbatch prepare_voxcpm_malayalam_alex.sbatch REPO_DIR RUNTIME_ROOT"}
-RUNTIME_ROOT=${2:?"usage: sbatch prepare_voxcpm_malayalam_alex.sbatch REPO_DIR RUNTIME_ROOT"}
+REPO_DIR=${1:?"usage: sbatch prepare_voxcpm_malayalam_alex.sbatch REPO_DIR RUNTIME_ROOT [pilot|full]"}
+RUNTIME_ROOT=${2:?"usage: sbatch prepare_voxcpm_malayalam_alex.sbatch REPO_DIR RUNTIME_ROOT [pilot|full]"}
+PROFILE=${3:-pilot}
 
 REPO_DIR=$(realpath "${REPO_DIR}")
 mkdir -p "${RUNTIME_ROOT}"
@@ -19,9 +20,26 @@ RUNTIME_ROOT=$(realpath "${RUNTIME_ROOT}")
 
 CONDA_ENV=${RUNTIME_ROOT}/envs/voxcpm
 MODEL_DIR=${RUNTIME_ROOT}/models/VoxCPM2
-DATA_DIR=${RUNTIME_ROOT}/datasets/tts-ml-20k
-RUN_DIR=${RUNTIME_ROOT}/runs/malayalam-pilot
-JOB_ENV=${RUNTIME_ROOT}/alex.env
+case "${PROFILE}" in
+    pilot)
+        DATA_DIR=${RUNTIME_ROOT}/datasets/tts-ml-20k
+        RUN_DIR=${RUNTIME_ROOT}/runs/malayalam-pilot
+        JOB_ENV=${RUNTIME_ROOT}/alex.env
+        TRAIN_CONFIG=conf/voxcpm_v2/voxcpm_finetune_malayalam_lora.yaml
+        DATASET_ARGS=(--total-samples 20000)
+        ;;
+    full)
+        DATA_DIR=${RUNTIME_ROOT}/datasets/tts-ml-full
+        RUN_DIR=${RUNTIME_ROOT}/runs/malayalam-full-3epoch
+        JOB_ENV=${RUNTIME_ROOT}/alex-full.env
+        TRAIN_CONFIG=conf/voxcpm_v2/voxcpm_finetune_malayalam_full_3epoch_lora.yaml
+        DATASET_ARGS=(--all-samples)
+        ;;
+    *)
+        echo "Unknown profile '${PROFILE}'; expected pilot or full" >&2
+        exit 2
+        ;;
+esac
 
 module load python
 
@@ -59,7 +77,7 @@ fi
 cd "${REPO_DIR}"
 python scripts/prepare_tts_ml_subset.py \
     --output-dir "${DATA_DIR}" \
-    --total-samples 20000 \
+    "${DATASET_ARGS[@]}" \
     --validation-samples 500 \
     --seed 42 \
     --shuffle-buffer 1000 \
@@ -73,8 +91,8 @@ VOXCPM_PRETRAINED_PATH=${MODEL_DIR}
 MALAYALAM_TRAIN_MANIFEST=${DATA_DIR}/train.jsonl
 MALAYALAM_VAL_MANIFEST=${DATA_DIR}/val.jsonl
 VOXCPM_RUN_DIR=${RUN_DIR}
-VOXCPM_TRAIN_CONFIG=conf/voxcpm_v2/voxcpm_finetune_malayalam_lora.yaml
+VOXCPM_TRAIN_CONFIG=${TRAIN_CONFIG}
 HF_HOME=${RUNTIME_ROOT}/huggingface-cache
 EOF
 
-echo "Preparation complete. Training environment: ${JOB_ENV}"
+echo "Preparation profile '${PROFILE}' complete. Training environment: ${JOB_ENV}"

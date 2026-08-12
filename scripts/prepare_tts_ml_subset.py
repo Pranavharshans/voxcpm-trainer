@@ -70,16 +70,23 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--total-samples", type=int, default=20_000)
+    parser.add_argument(
+        "--all-samples",
+        action="store_true",
+        help="Consume the complete split and keep every valid row instead of stopping at --total-samples",
+    )
     parser.add_argument("--validation-samples", type=int, default=500)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--shuffle-buffer", type=int, default=1_000)
     parser.add_argument("--cache-dir", type=Path, default=None)
     args = parser.parse_args()
 
-    if args.total_samples <= 0:
+    if not args.all_samples and args.total_samples <= 0:
         parser.error("--total-samples must be positive")
-    if not 0 <= args.validation_samples < args.total_samples:
-        parser.error("--validation-samples must be between 0 and total-samples - 1")
+    if args.validation_samples < 0:
+        parser.error("--validation-samples must be non-negative")
+    if not args.all_samples and args.validation_samples >= args.total_samples:
+        parser.error("--validation-samples must be less than --total-samples")
     if args.shuffle_buffer <= 0:
         parser.error("--shuffle-buffer must be positive")
 
@@ -97,7 +104,8 @@ def main() -> int:
             metadata.get("preparation_version") == PREPARATION_VERSION
             and metadata.get("dataset") == DATASET_ID
             and metadata.get("dataset_revision") == DATASET_REVISION
-            and metadata.get("total_samples") == args.total_samples
+            and bool(metadata.get("all_samples", False)) == args.all_samples
+            and (args.all_samples or metadata.get("total_samples") == args.total_samples)
             and metadata.get("validation_samples") == args.validation_samples
             and metadata.get("seed") == args.seed
             and final_train.is_file()
@@ -124,7 +132,7 @@ def main() -> int:
 
     with train_tmp.open("w", encoding="utf-8") as train_handle, val_tmp.open("w", encoding="utf-8") as val_handle:
         for row in stream:
-            if accepted >= args.total_samples:
+            if not args.all_samples and accepted >= args.total_samples:
                 break
             source_rows_seen += 1
             try:
@@ -164,12 +172,18 @@ def main() -> int:
             accepted += 1
 
             if accepted % 1_000 == 0:
-                print(f"Prepared {accepted}/{args.total_samples} samples (resampled={resampled})")
+                target = "all" if args.all_samples else str(args.total_samples)
+                print(f"Prepared {accepted}/{target} samples (resampled={resampled})")
 
-    if accepted != args.total_samples:
+    if not args.all_samples and accepted != args.total_samples:
         raise RuntimeError(
             f"Dataset stream ended after {accepted} accepted samples "
             f"({source_rows_seen} rows inspected, {skipped} skipped)"
+        )
+    if accepted <= args.validation_samples:
+        raise RuntimeError(
+            f"Only {accepted} valid samples were found; validation requires {args.validation_samples} "
+            "and at least one training sample"
         )
 
     train_tmp.replace(final_train)
@@ -179,8 +193,9 @@ def main() -> int:
         "dataset": DATASET_ID,
         "dataset_revision": DATASET_REVISION,
         "split": "train",
-        "total_samples": args.total_samples,
-        "training_samples": args.total_samples - args.validation_samples,
+        "all_samples": args.all_samples,
+        "total_samples": accepted,
+        "training_samples": accepted - args.validation_samples,
         "validation_samples": args.validation_samples,
         "sample_rate": SAMPLE_RATE,
         "seed": args.seed,

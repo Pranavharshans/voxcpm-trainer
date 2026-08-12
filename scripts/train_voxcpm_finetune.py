@@ -40,6 +40,7 @@ from voxcpm.training import (
     load_audio_text_datasets,
 )
 from voxcpm.training.text import normalize_training_text
+from voxcpm.training.schedule import build_epoch_end_schedule
 
 
 @argbind.bind(without_prefix=True)
@@ -53,9 +54,14 @@ def train(
     grad_accum_steps: int = 1,
     num_workers: int = 2,
     num_iters: int = 100_000,
+    num_epochs: int = 0,
     log_interval: int = 100,
     valid_interval: int = 1_000,
     save_interval: int = 10_000,
+    validate_at_epoch_end: bool = False,
+    save_at_epoch_end: bool = False,
+    eval_audio_samples: int = 2,
+    save_eval_audio: bool = True,
     learning_rate: float = 1e-4,
     weight_decay: float = 1e-2,
     warmup_steps: int = 1_000,
@@ -129,8 +135,6 @@ def train(
         val_ds = val_ds.map(tokenize, batched=True, remove_columns=["text"])
 
     dataset_cnt = int(max(train_ds["dataset_id"])) + 1 if "dataset_id" in train_ds.column_names else 1
-    num_train_samples = len(train_ds)
-
     # ------------------------------------------------------------------ #
     # Optional: filter samples by estimated token count to avoid OOM
     # Enabled when max_batch_tokens > 0:
@@ -157,6 +161,28 @@ def train(
             )
         train_ds = train_ds.select(keep_indices)
 
+    num_train_samples = len(train_ds)
+    if num_train_samples == 0:
+        raise ValueError("No training samples remain after filtering")
+
+    epoch_end_steps = {}
+    if num_epochs > 0:
+        num_iters, epoch_end_steps = build_epoch_end_schedule(
+            num_samples=num_train_samples,
+            batch_size=batch_size,
+            grad_accum_steps=max(int(grad_accum_steps), 1),
+            world_size=accelerator.world_size,
+            num_epochs=num_epochs,
+        )
+        if accelerator.rank == 0:
+            boundaries = ", ".join(
+                f"epoch {epoch}: step {step + 1}" for step, epoch in epoch_end_steps.items()
+            )
+            tracker.print(
+                f"Resolved {num_epochs} epochs over {num_train_samples} samples to "
+                f"{num_iters} optimizer steps ({boundaries})."
+            )
+
     train_loader = build_dataloader(
         train_ds,
         accelerator=accelerator,
@@ -171,6 +197,7 @@ def train(
             batch_size=batch_size,
             num_workers=num_workers,
             drop_last=False,
+            shuffle=False,
         )
         if val_ds is not None
         else None
@@ -258,6 +285,7 @@ def train(
     grad_accum_steps = max(int(grad_accum_steps), 1)
     data_epoch = 0
     train_iter = iter(train_loader)
+    last_saved_step = None
 
     def get_next_batch():
         """Get next batch, handles epoch boundary and DistributedSampler."""
@@ -331,12 +359,17 @@ def train(
                 loss_values = {k: v.item() if isinstance(v, torch.Tensor) else float(v) for k, v in loss_dict.items()}
                 loss_values["lr"] = float(optimizer.param_groups[0]["lr"])
                 # Account for all GPUs when converting steps to epochs.
-                epoch = (step * grad_accum_steps * batch_size * accelerator.world_size) / max(1, num_train_samples)
+                epoch = ((step + 1) * grad_accum_steps * batch_size * accelerator.world_size) / max(
+                    1, num_train_samples
+                )
                 loss_values["epoch"] = float(epoch)
                 loss_values["grad_norm"] = float(grad_norm)
                 tracker.log_metrics(loss_values, split="train")
 
-            if val_loader is not None and (step % valid_interval == 0 or step == num_iters - 1):
+            completed_epoch = epoch_end_steps.get(step)
+            interval_validation = valid_interval > 0 and step % valid_interval == 0
+            epoch_validation = validate_at_epoch_end and completed_epoch is not None
+            if val_loader is not None and (interval_validation or epoch_validation or step == num_iters - 1):
                 validate(
                     model,
                     val_loader,
@@ -353,13 +386,41 @@ def train(
                     val_texts=val_texts,
                     tokenizer=tokenizer,
                     valid_interval=valid_interval,
+                    num_audio_samples=eval_audio_samples,
+                    audio_output_dir=save_dir.parent / "eval_samples" if save_eval_audio else None,
+                    audio_label=f"epoch_{completed_epoch:02d}" if completed_epoch is not None else None,
                 )
 
-            if (step % save_interval == 0 or step == num_iters - 1) and accelerator.rank == 0:
-                save_checkpoint(model, optimizer, scheduler, save_dir, step, pretrained_path, hf_model_id, distribute)
+            interval_save = save_interval > 0 and step % save_interval == 0
+            epoch_save = save_at_epoch_end and completed_epoch is not None
+            if (interval_save or epoch_save or step == num_iters - 1) and accelerator.rank == 0:
+                checkpoint_tag = f"epoch_{completed_epoch:02d}" if completed_epoch is not None else None
+                save_checkpoint(
+                    model,
+                    optimizer,
+                    scheduler,
+                    save_dir,
+                    step,
+                    pretrained_path,
+                    hf_model_id,
+                    distribute,
+                    tag=checkpoint_tag,
+                    resume_step=step + 1,
+                )
+                last_saved_step = step
 
-    if accelerator.rank == 0:
-        save_checkpoint(model, optimizer, scheduler, save_dir, num_iters, pretrained_path, hf_model_id, distribute)
+    if accelerator.rank == 0 and last_saved_step != num_iters - 1:
+        save_checkpoint(
+            model,
+            optimizer,
+            scheduler,
+            save_dir,
+            num_iters - 1,
+            pretrained_path,
+            hf_model_id,
+            distribute,
+            resume_step=num_iters,
+        )
     if writer:
         writer.close()
 
@@ -380,6 +441,9 @@ def validate(
     val_texts=None,
     tokenizer=None,
     valid_interval=1000,
+    num_audio_samples=2,
+    audio_output_dir=None,
+    audio_label=None,
 ):
     """Validate and generate sample audio"""
     import numpy as np  # noqa: F401
@@ -447,6 +511,9 @@ def validate(
                 tokenizer=tokenizer,
                 valid_interval=valid_interval,
                 tracker=tracker,
+                num_samples=num_audio_samples,
+                audio_output_dir=audio_output_dir,
+                audio_label=audio_label,
             )
         except Exception as e:
             tracker.print(f"[Warning] Failed to generate sample audio: {e}")
@@ -551,13 +618,23 @@ def generate_sample_audio(
     pretrained_path=None,
     valid_interval=1000,
     tracker=None,
+    num_samples=2,
+    audio_output_dir=None,
+    audio_label=None,
 ):
-    """Select 2 fixed validation samples, generate audio and log to TensorBoard"""
+    """Generate fixed validation samples for TensorBoard and optional WAV files."""
     import numpy as np
+    import soundfile as sf
 
     log = tracker.print if tracker else print
-    num_samples = min(2, len(val_ds))
+    num_samples = min(max(int(num_samples), 0), len(val_ds))
     log(f"[Audio] Starting audio generation for {num_samples} samples at step {step}")
+
+    output_folder = None
+    if audio_output_dir is not None:
+        label = audio_label or f"step_{step:07d}"
+        output_folder = Path(audio_output_dir) / label
+        output_folder.mkdir(parents=True, exist_ok=True)
 
     unwrapped_model = accelerator.unwrap(model)
     # Determine the correct output sample rate for generated audio.
@@ -625,11 +702,20 @@ def generate_sample_audio(
             writer.add_audio(f"{tag}/generated_audio", gen_audio_np, global_step=step, sample_rate=gen_sr)
             log(f"[Audio] Generated audio for sample {i}: duration={len(gen_audio_np)/gen_sr:.2f}s")
 
+            if output_folder is not None:
+                generated_path = output_folder / f"sample_{i}_generated.wav"
+                sf.write(generated_path, gen_audio_np, gen_sr, subtype="PCM_16")
+                (output_folder / f"sample_{i}_text.txt").write_text(text + "\n", encoding="utf-8")
+                log(f"[Audio] Saved generated sample to {generated_path}")
+
             # Log reference audio (at encoder input rate, which is what val_ds provides)
             if ref_audio_np is not None:
                 writer.add_audio(
                     f"{tag}/reference_audio", normalize_audio(ref_audio_np), global_step=step, sample_rate=sample_rate
                 )
+                if output_folder is not None:
+                    reference_path = output_folder / f"sample_{i}_reference.wav"
+                    sf.write(reference_path, normalize_audio(ref_audio_np), sample_rate, subtype="PCM_16")
 
             # Generate mel spectrogram figure
             try:
@@ -755,6 +841,8 @@ def save_checkpoint(
     pretrained_path: str = None,
     hf_model_id: str = "",
     distribute: bool = False,
+    tag: str = None,
+    resume_step: int = None,
 ):
     """
     Save checkpoint with different strategies for full finetune vs LoRA:
@@ -764,8 +852,8 @@ def save_checkpoint(
     import shutil
 
     save_dir.mkdir(parents=True, exist_ok=True)
-    tag = f"step_{step:07d}"
-    folder = save_dir / tag
+    checkpoint_tag = tag or f"step_{step:07d}"
+    folder = save_dir / checkpoint_tag
     folder.mkdir(parents=True, exist_ok=True)
 
     unwrapped = model.module if hasattr(model, "module") else model
@@ -816,7 +904,7 @@ def save_checkpoint(
     torch.save(optimizer.state_dict(), folder / "optimizer.pth")
     torch.save(scheduler.state_dict(), folder / "scheduler.pth")
     with open(folder / "training_state.json", "w", encoding="utf-8") as f:
-        json.dump({"step": int(step)}, f)
+        json.dump({"step": int(resume_step if resume_step is not None else step)}, f)
 
     # Update (or create) a `latest` folder by copying the most recent checkpoint
     latest_link = save_dir / "latest"

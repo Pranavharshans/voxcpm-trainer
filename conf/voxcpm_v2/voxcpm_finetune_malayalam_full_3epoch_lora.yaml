@@ -21,6 +21,8 @@ validate_at_epoch_end: true
 save_at_epoch_end: true
 eval_audio_samples: 4
 save_eval_audio: true
+eval_prompt_audio: ${VOXCPM_EVAL_PROMPT_AUDIO}
+eval_prompt_text: I went to the store to buy some fresh fruits and snacks for the evening
 learning_rate: 0.00005
 weight_decay: 0.01
 warmup_steps: 500

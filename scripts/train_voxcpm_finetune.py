@@ -62,6 +62,8 @@ def train(
     save_at_epoch_end: bool = False,
     eval_audio_samples: int = 2,
     save_eval_audio: bool = True,
+    eval_prompt_audio: str = "",
+    eval_prompt_text: str = "",
     learning_rate: float = 1e-4,
     weight_decay: float = 1e-2,
     warmup_steps: int = 1_000,
@@ -85,6 +87,11 @@ def train(
         raise ValueError("hf_model_id is required when distribute=True")
 
     accelerator = Accelerator(amp=True)
+
+    if bool(eval_prompt_audio) != bool(eval_prompt_text):
+        raise ValueError("eval_prompt_audio and eval_prompt_text must either both be set or both be empty")
+    if eval_prompt_audio and not Path(eval_prompt_audio).is_file():
+        raise FileNotFoundError(f"Evaluation prompt audio does not exist: {eval_prompt_audio}")
 
     save_dir = Path(save_path)
     tb_dir = Path(tensorboard) if tensorboard else save_dir / "logs"
@@ -389,6 +396,8 @@ def train(
                     num_audio_samples=eval_audio_samples,
                     audio_output_dir=save_dir.parent / "eval_samples" if save_eval_audio else None,
                     audio_label=f"epoch_{completed_epoch:02d}" if completed_epoch is not None else None,
+                    prompt_audio_path=eval_prompt_audio or None,
+                    prompt_text=eval_prompt_text or None,
                 )
 
             interval_save = save_interval > 0 and step % save_interval == 0
@@ -444,6 +453,8 @@ def validate(
     num_audio_samples=2,
     audio_output_dir=None,
     audio_label=None,
+    prompt_audio_path=None,
+    prompt_text=None,
 ):
     """Validate and generate sample audio"""
     import numpy as np  # noqa: F401
@@ -514,6 +525,8 @@ def validate(
                 num_samples=num_audio_samples,
                 audio_output_dir=audio_output_dir,
                 audio_label=audio_label,
+                prompt_audio_path=prompt_audio_path,
+                prompt_text=prompt_text,
             )
         except Exception as e:
             tracker.print(f"[Warning] Failed to generate sample audio: {e}")
@@ -621,6 +634,8 @@ def generate_sample_audio(
     num_samples=2,
     audio_output_dir=None,
     audio_label=None,
+    prompt_audio_path=None,
+    prompt_text=None,
 ):
     """Generate fixed validation samples for TensorBoard and optional WAV files."""
     import numpy as np
@@ -635,6 +650,14 @@ def generate_sample_audio(
         label = audio_label or f"step_{step:07d}"
         output_folder = Path(audio_output_dir) / label
         output_folder.mkdir(parents=True, exist_ok=True)
+        if prompt_audio_path:
+            import shutil
+
+            shutil.copy2(prompt_audio_path, output_folder / "voice_prompt.wav")
+            (output_folder / "voice_prompt_text.txt").write_text(prompt_text + "\n", encoding="utf-8")
+
+    if prompt_audio_path:
+        log(f"[Audio] Using voice prompt: {prompt_audio_path}")
 
     unwrapped_model = accelerator.unwrap(model)
     # Determine the correct output sample rate for generated audio.
@@ -678,9 +701,18 @@ def generate_sample_audio(
             )
             with torch.no_grad():
                 with autocast_ctx:
-                    generated = unwrapped_model.generate(
-                        target_text=text, inference_timesteps=10, cfg_value=2.0, seed=42
-                    )
+                    generation_args = {
+                        "target_text": text,
+                        "inference_timesteps": 10,
+                        "cfg_value": 2.0,
+                        "seed": 42,
+                    }
+                    if prompt_audio_path:
+                        generation_args.update(
+                            prompt_wav_path=str(prompt_audio_path),
+                            prompt_text=prompt_text,
+                        )
+                    generated = unwrapped_model.generate(**generation_args)
 
             # Restore training setup
             # unwrapped_model.to(torch.float32)

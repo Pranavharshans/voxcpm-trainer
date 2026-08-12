@@ -217,3 +217,69 @@ Each evaluation directory contains the generated WAV, held-out ground-truth
 WAV, Malayalam target transcript, `voice_prompt.wav`, and
 `voice_prompt_text.txt`. The same Maya prompt and target sentences are used at
 all three epoch boundaries, making the audio comparisons consistent.
+
+## Full-parameter SFT follow-up
+
+Use the `sft` profile only after reviewing the LoRA baseline. It reuses the
+existing full Malayalam dataset but starts from the original VoxCPM2 base
+checkpoint, not from the LoRA adapter. The AudioVAE stays frozen; all other
+model parameters are updated for exactly two epochs at a conservative `1e-5`
+learning rate. This clean separation makes LoRA and SFT results comparable.
+
+The SFT run writes to `runs/malayalam-full-sft-2epoch`, so it cannot resume
+from or overwrite the LoRA checkpoints. It produces `epoch_01` and `epoch_02`
+full-model checkpoints and the same four Maya-conditioned evaluation samples
+at both boundaries.
+
+After the LoRA job completes, pull `main` and submit the lightweight setup job:
+
+```bash
+VOX_STORAGE=$(ws_find voxcpm-ml)
+REPO="$VOX_STORAGE/vox-trainer"
+RUNTIME="$VOX_STORAGE/voxcpm-runtime"
+
+git -C "$REPO" pull --ff-only origin main
+
+SFT_PREP_JOB=$(sbatch --parsable \
+  --output="$VOX_STORAGE/voxcpm-sft-prep-%j.out" \
+  "$REPO/scripts/slurm/prepare_voxcpm_malayalam_alex.sbatch" \
+  "$REPO" \
+  "$RUNTIME" \
+  sft)
+```
+
+Then submit one RTX Pro 6000 with an `afterok` dependency:
+
+```bash
+SFT_JOB=$(sbatch --parsable \
+  --partition=rtxpro6k \
+  --gres=gpu:rtxpro6k:1 \
+  --cpus-per-task=16 \
+  --dependency="afterok:$SFT_PREP_JOB" \
+  --output="$VOX_STORAGE/voxcpm-sft-train-%j.out" \
+  "$REPO/scripts/slurm/train_voxcpm_malayalam_alex.sbatch" \
+  "$RUNTIME/alex-sft.env")
+
+echo "SFT preparation: $SFT_PREP_JOB"
+echo "SFT training: $SFT_JOB"
+```
+
+Full SFT uses substantially more VRAM and writes much larger checkpoints than
+LoRA. Confirm GPU memory after startup with:
+
+```bash
+srun --jobid="$SFT_JOB" --overlap --ntasks=1 --cpus-per-task=1 \
+  nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu \
+  --format=csv
+```
+
+SFT outputs are kept under:
+
+```text
+voxcpm-runtime/runs/malayalam-full-sft-2epoch/
+├── checkpoints/epoch_01/
+├── checkpoints/epoch_02/
+├── eval_samples/epoch_01/
+├── eval_samples/epoch_02/
+└── tensorboard/
+```

@@ -10,8 +10,8 @@
 set -euo pipefail
 unset SLURM_EXPORT_ENV
 
-REPO_DIR=${1:?"usage: sbatch prepare_voxcpm_malayalam_alex.sbatch REPO_DIR RUNTIME_ROOT [pilot|full]"}
-RUNTIME_ROOT=${2:?"usage: sbatch prepare_voxcpm_malayalam_alex.sbatch REPO_DIR RUNTIME_ROOT [pilot|full]"}
+REPO_DIR=${1:?"usage: sbatch prepare_voxcpm_malayalam_alex.sbatch REPO_DIR RUNTIME_ROOT [pilot|full|sft]"}
+RUNTIME_ROOT=${2:?"usage: sbatch prepare_voxcpm_malayalam_alex.sbatch REPO_DIR RUNTIME_ROOT [pilot|full|sft]"}
 PROFILE=${3:-pilot}
 
 REPO_DIR=$(realpath "${REPO_DIR}")
@@ -35,8 +35,15 @@ case "${PROFILE}" in
         TRAIN_CONFIG=conf/voxcpm_v2/voxcpm_finetune_malayalam_full_3epoch_lora.yaml
         DATASET_ARGS=(--all-samples)
         ;;
+    sft)
+        DATA_DIR=${RUNTIME_ROOT}/datasets/tts-ml-full
+        RUN_DIR=${RUNTIME_ROOT}/runs/malayalam-full-sft-2epoch
+        JOB_ENV=${RUNTIME_ROOT}/alex-sft.env
+        TRAIN_CONFIG=conf/voxcpm_v2/voxcpm_finetune_malayalam_full_sft_2epoch.yaml
+        DATASET_ARGS=(--all-samples)
+        ;;
     *)
-        echo "Unknown profile '${PROFILE}'; expected pilot or full" >&2
+        echo "Unknown profile '${PROFILE}'; expected pilot, full, or sft" >&2
         exit 2
         ;;
 esac

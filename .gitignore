@@ -7,4 +7,3 @@ voxcpm.egg-info
 app_local.py
 conf/slurm/*.env
 !conf/slurm/*.env.example
-assets/eval/*.wav

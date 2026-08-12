@@ -160,28 +160,9 @@ training rows that remain after audio/text validation and length filtering.
 It runs three passes with an effective batch of 16, a 500-step warmup, and a
 lower peak learning rate of `5e-5`. Validation and checkpointing occur at each
 epoch boundary. Four fixed held-out samples are generated at every boundary
-and saved both to TensorBoard and as ordinary WAV files. Those samples use the
-privately staged `Maya.wav` as the fixed voice prompt with its supplied English
+and saved both to TensorBoard and as ordinary WAV files. Those samples use
+`assets/eval/Maya.wav` as the fixed voice prompt with its supplied English
 transcript, while the synthesis targets remain held-out Malayalam sentences.
-
-Keep the voice recording out of the public Git repository. Before submitting
-the jobs, copy it from the Mac into the private Alex workspace (while connected
-to the FAU network/VPN):
-
-```bash
-ssh v123be62@alex.nhr.fau.de \
-  'mkdir -p /anvme/workspace/v123be62-voxcpm-ml/voxcpm-runtime/eval'
-
-scp "$HOME/Downloads/Maya.wav" \
-  v123be62@alex.nhr.fau.de:/anvme/workspace/v123be62-voxcpm-ml/voxcpm-runtime/eval/Maya.wav
-```
-
-Verify the private file from an Alex terminal:
-
-```bash
-VOX_STORAGE=$(ws_find voxcpm-ml)
-file "$VOX_STORAGE/voxcpm-runtime/eval/Maya.wav"
-```
 
 From the login node, update the NVMe repository and only submit/inspect jobs:
 

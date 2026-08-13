@@ -64,6 +64,9 @@ mkdir -p "${VOXCPM_RUN_DIR}"
 export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
 export HF_HOME=${HF_HOME:-${VOXCPM_RUN_DIR}/huggingface-cache}
+# Reduce CUDA allocator fragmentation for long, variable-duration TTS batches.
+# Preserve an explicit value supplied by the job environment.
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
 NPROC_PER_NODE=${SLURM_GPUS_ON_NODE:-1}
 if [[ ! "${NPROC_PER_NODE}" =~ ^[0-9]+$ ]]; then

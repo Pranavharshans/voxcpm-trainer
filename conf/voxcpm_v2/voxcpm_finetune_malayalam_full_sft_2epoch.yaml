@@ -16,7 +16,9 @@ num_iters: 0
 num_epochs: 2
 log_interval: 10
 valid_interval: 0
-save_interval: 0
+# Full-SFT checkpoints are large, but periodic recovery points avoid losing an
+# entire epoch if a rare long sample or cluster interruption terminates a run.
+save_interval: 500
 validate_at_epoch_end: true
 save_at_epoch_end: true
 eval_audio_samples: 4
@@ -29,7 +31,9 @@ learning_rate: 0.00001
 weight_decay: 0.01
 warmup_steps: 800
 max_steps: 0
-max_batch_tokens: 8192
+# Keep enough activation-memory headroom for full-parameter SFT on one A100
+# 80 GB. The previous 8192-token cap reached 81,156 MiB and OOMed mid-epoch.
+max_batch_tokens: 6144
 max_grad_norm: 1.0
 save_path: ${VOXCPM_RUN_DIR}/checkpoints
 tensorboard: ${VOXCPM_RUN_DIR}/tensorboard

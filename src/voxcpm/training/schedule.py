@@ -43,6 +43,34 @@ def resolve_grad_accum_steps(
     return resolved
 
 
+def resolve_data_resume_position(
+    *,
+    start_step: int,
+    grad_accum_steps: int,
+    batches_per_epoch: int,
+) -> tuple[int, int]:
+    """Map an optimizer resume step to sampler epoch and batch offset.
+
+    Each optimizer step consumes ``grad_accum_steps`` dataloader batches on
+    every rank. The returned offset is rank-local because distributed samplers
+    expose one rank-local sequence each epoch.
+    """
+
+    values = {
+        "start_step": start_step,
+        "grad_accum_steps": grad_accum_steps,
+        "batches_per_epoch": batches_per_epoch,
+    }
+    negative = [name for name, value in values.items() if int(value) < 0]
+    if negative:
+        raise ValueError(f"Resume schedule values cannot be negative: {', '.join(negative)}")
+    if int(grad_accum_steps) == 0 or int(batches_per_epoch) == 0:
+        raise ValueError("grad_accum_steps and batches_per_epoch must be positive")
+
+    consumed_batches = int(start_step) * int(grad_accum_steps)
+    return divmod(consumed_batches, int(batches_per_epoch))
+
+
 def build_epoch_end_schedule(
     *,
     num_samples: int,

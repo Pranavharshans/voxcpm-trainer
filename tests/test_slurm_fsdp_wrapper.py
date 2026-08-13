@@ -28,7 +28,9 @@ class SlurmFSDPWrapperTests(unittest.TestCase):
                 'printf "%s\\n" "$1" > "$WRAPPER_TEST_CAPTURE"\n',
                 encoding="utf-8",
             )
-            fake_launcher.chmod(0o755)
+            # Match the real generic launcher: `sbatch` only requires it to be
+            # readable, so the FSDP wrapper must not assume it is executable.
+            fake_launcher.chmod(0o644)
 
             job_env = tmp_path / "alex-sft-fsdp-smoke.env"
             job_env.write_text(f"VOXCPM_REPO_DIR={shlex.quote(str(fake_repo))}\n", encoding="utf-8")

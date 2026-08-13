@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import itertools
 import os
 import random
 import typing
@@ -11,6 +12,38 @@ import torch
 import torch.distributed as dist
 import torch.utils.data
 from torch.nn.parallel import DistributedDataParallel
+
+
+class OffsetDistributedSampler(torch.utils.data.distributed.DistributedSampler):
+    """Distributed sampler that can resume within a deterministic epoch.
+
+    ``DistributedSampler`` already derives a stable permutation from
+    ``seed + epoch``. This subclass skips indices at the sampler level, so a
+    resumed job does not decode thousands of audio rows merely to recover its
+    previous dataloader position.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.start_index = 0
+
+    def set_start_index(self, start_index: int) -> None:
+        start_index = int(start_index)
+        if start_index < 0 or start_index > self.num_samples:
+            raise ValueError(
+                f"start_index must be between 0 and {self.num_samples}, got {start_index}"
+            )
+        self.start_index = start_index
+
+    def set_epoch(self, epoch: int) -> None:
+        super().set_epoch(epoch)
+        self.start_index = 0
+
+    def __iter__(self):
+        return itertools.islice(super().__iter__(), self.start_index, None)
+
+    def __len__(self) -> int:
+        return self.num_samples - self.start_index
 
 
 class Accelerator:
@@ -181,30 +214,6 @@ class Accelerator:
             return model.clip_grad_norm_(max_norm)
         return torch.nn.utils.clip_grad_norm_(self.unwrap(model).parameters(), max_norm=max_norm)
 
-    @contextlib.contextmanager
-    def summon_full_params(self, model: torch.nn.Module):
-        """Expose an unwrapped full model for deterministic FSDP inference.
-
-        Every rank must enter this context. Parameters are materialized on all
-        ranks and every rank executes the same custom ``generate`` calls so
-        nested FSDP wrappers perform matching collectives. Only rank zero
-        writes the resulting artifacts.
-        """
-
-        if self.is_fsdp:
-            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-
-            with FSDP.summon_full_params(
-                model,
-                recurse=True,
-                writeback=False,
-                rank0_only=False,
-                offload_to_cpu=False,
-            ):
-                yield self.unwrap(model)
-        else:
-            yield self.unwrap(model)
-
     @property
     def device(self):
         if torch.cuda.is_available():
@@ -242,7 +251,7 @@ class Accelerator:
         drop_last: bool = False,
     ) -> torch.utils.data.DataLoader:
         if self.world_size > 1:
-            sampler = torch.utils.data.distributed.DistributedSampler(
+            sampler = OffsetDistributedSampler(
                 dataset, num_replicas=self.world_size, rank=self.rank, shuffle=shuffle
             )
             shuffle = False

@@ -38,4 +38,7 @@ if [[ ! -f "${LAUNCHER}" ]]; then
     exit 2
 fi
 
-exec "${LAUNCHER}" "${JOB_ENV}"
+# The generic launcher is submitted through `sbatch` elsewhere and therefore
+# does not need its executable bit set. Invoke it explicitly with a login Bash
+# so this wrapper also works from Slurm's private spool copy.
+exec /bin/bash -l "${LAUNCHER}" "${JOB_ENV}"

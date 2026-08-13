@@ -40,7 +40,11 @@ from voxcpm.training import (
     load_audio_text_datasets,
 )
 from voxcpm.training.text import normalize_training_text
-from voxcpm.training.schedule import build_epoch_end_schedule, resolve_grad_accum_steps
+from voxcpm.training.schedule import (
+    build_epoch_end_schedule,
+    resolve_data_resume_position,
+    resolve_grad_accum_steps,
+)
 
 
 @argbind.bind(without_prefix=True)
@@ -328,6 +332,28 @@ def train(
     # Manual epoch management instead of itertools.cycle to support DistributedSampler.set_epoch()
     grad_accum_steps = max(int(grad_accum_steps), 1)
     data_epoch = 0
+    sampler = getattr(train_loader, "sampler", None)
+    batches_per_data_epoch = len(train_loader)
+    if start_step > 0:
+        data_epoch, batch_offset = resolve_data_resume_position(
+            start_step=start_step,
+            grad_accum_steps=grad_accum_steps,
+            batches_per_epoch=batches_per_data_epoch,
+        )
+        if hasattr(sampler, "set_epoch"):
+            sampler.set_epoch(data_epoch)
+        if batch_offset:
+            if not hasattr(sampler, "set_start_index"):
+                raise RuntimeError(
+                    "Exact checkpoint resume requires a sampler with set_start_index(); "
+                    f"got {type(sampler).__name__}"
+                )
+            sampler.set_start_index(batch_offset * batch_size)
+        if accelerator.rank == 0:
+            tracker.print(
+                f"Restored dataloader position: data_epoch={data_epoch}, "
+                f"rank_local_batch_offset={batch_offset}."
+            )
     train_iter = iter(train_loader)
     last_saved_step = None
 
@@ -347,8 +373,6 @@ def train(
 
     with tracker.live():
         for step in range(start_step, num_iters):
-            # update resume step so signal handler can save current progress
-            resume["step"] = step
             tracker.step = step
             optimizer.zero_grad(set_to_none=True)
 
@@ -398,6 +422,10 @@ def train(
             accelerator.step(optimizer)
             accelerator.update()
             scheduler.step()
+            # The model and optimizer now represent the next optimizer step.
+            # If a signal arrives during the following step, saving this value
+            # safely replays only work that had not completed.
+            resume["step"] = step + 1
 
             if step % log_interval == 0 or step == num_iters - 1:
                 loss_values = {k: v.item() if isinstance(v, torch.Tensor) else float(v) for k, v in loss_dict.items()}
@@ -411,6 +439,27 @@ def train(
                 tracker.log_metrics(loss_values, split="train")
 
             completed_epoch = epoch_end_steps.get(step)
+            # Persist the trained state before validation or sample generation.
+            # This makes epoch checkpoints recoverable even if evaluation fails.
+            interval_save = save_interval > 0 and step % save_interval == 0
+            epoch_save = save_at_epoch_end and completed_epoch is not None
+            if interval_save or epoch_save or step == num_iters - 1:
+                checkpoint_tag = f"epoch_{completed_epoch:02d}" if completed_epoch is not None else None
+                save_checkpoint(
+                    model,
+                    optimizer,
+                    scheduler,
+                    save_dir,
+                    step,
+                    pretrained_path,
+                    hf_model_id,
+                    distribute,
+                    tag=checkpoint_tag,
+                    resume_step=step + 1,
+                    accelerator=accelerator,
+                )
+                last_saved_step = step
+
             interval_validation = valid_interval > 0 and step % valid_interval == 0
             epoch_validation = validate_at_epoch_end and completed_epoch is not None
             if val_loader is not None and (interval_validation or epoch_validation or step == num_iters - 1):
@@ -436,25 +485,6 @@ def train(
                     prompt_audio_path=eval_prompt_audio or None,
                     prompt_text=eval_prompt_text or None,
                 )
-
-            interval_save = save_interval > 0 and step % save_interval == 0
-            epoch_save = save_at_epoch_end and completed_epoch is not None
-            if interval_save or epoch_save or step == num_iters - 1:
-                checkpoint_tag = f"epoch_{completed_epoch:02d}" if completed_epoch is not None else None
-                save_checkpoint(
-                    model,
-                    optimizer,
-                    scheduler,
-                    save_dir,
-                    step,
-                    pretrained_path,
-                    hf_model_id,
-                    distribute,
-                    tag=checkpoint_tag,
-                    resume_step=step + 1,
-                    accelerator=accelerator,
-                )
-                last_saved_step = step
 
     if last_saved_step != num_iters - 1:
         save_checkpoint(
@@ -545,34 +575,38 @@ def validate(
 
         tracker.log_metrics(val_metrics, split="val")
 
-    # FSDP's nested wrappers use collectives during forward, so every rank
-    # participates in deterministic sample generation. Only rank zero writes
-    # TensorBoard/WAV artifacts.
-    should_generate = val_ds is not None and audio_vae is not None and (writer is not None or accelerator.is_fsdp)
+    # Custom VoxCPM generation methods bypass normal FSDP forward boundaries,
+    # and PyTorch forbids starting forward work inside summon_full_params().
+    # FSDP jobs therefore generate WAVs from their saved full checkpoints in a
+    # fresh single-process evaluator after torchrun exits.
+    should_generate = (
+        not accelerator.is_fsdp
+        and val_ds is not None
+        and audio_vae is not None
+        and writer is not None
+    )
     if should_generate:
         try:
-            with accelerator.summon_full_params(model) as generation_model:
-                generate_sample_audio(
-                    generation_model,
-                    val_ds,
-                    audio_vae,
-                    writer,
-                    step,
-                    accelerator,
-                    sample_rate,
-                    out_sample_rate=out_sample_rate,
-                    val_texts=val_texts,
-                    tokenizer=tokenizer,
-                    valid_interval=valid_interval,
-                    tracker=tracker if accelerator.rank == 0 else None,
-                    num_samples=num_audio_samples,
-                    audio_output_dir=audio_output_dir if accelerator.rank == 0 else None,
-                    audio_label=audio_label,
-                    prompt_audio_path=prompt_audio_path,
-                    prompt_text=prompt_text,
-                    write_outputs=accelerator.rank == 0,
-                )
-            accelerator.barrier()
+            generate_sample_audio(
+                model,
+                val_ds,
+                audio_vae,
+                writer,
+                step,
+                accelerator,
+                sample_rate,
+                out_sample_rate=out_sample_rate,
+                val_texts=val_texts,
+                tokenizer=tokenizer,
+                valid_interval=valid_interval,
+                tracker=tracker,
+                num_samples=num_audio_samples,
+                audio_output_dir=audio_output_dir,
+                audio_label=audio_label,
+                prompt_audio_path=prompt_audio_path,
+                prompt_text=prompt_text,
+                write_outputs=True,
+            )
         except Exception as e:
             if accelerator.rank == 0:
                 tracker.print(f"[Warning] Failed to generate sample audio: {e}")
@@ -584,6 +618,11 @@ def validate(
             if accelerator.rank == 0:
                 tracker.print(buf.getvalue())
     else:
+        if accelerator.is_fsdp and num_audio_samples > 0 and accelerator.rank == 0:
+            tracker.print(
+                "[Audio] Deferred FSDP sample generation until after training; "
+                "epoch checkpoints are already saved."
+            )
         # Log why audio generation was skipped
         missing = []
         if writer is None:

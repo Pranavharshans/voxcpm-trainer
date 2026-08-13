@@ -16,6 +16,7 @@ assert spec.loader is not None
 spec.loader.exec_module(schedule_module)
 
 build_epoch_end_schedule = schedule_module.build_epoch_end_schedule
+resolve_data_resume_position = schedule_module.resolve_data_resume_position
 resolve_grad_accum_steps = schedule_module.resolve_grad_accum_steps
 
 
@@ -78,4 +79,26 @@ def test_uses_fallback_when_global_batch_is_disabled():
             fallback_grad_accum_steps=3,
         )
         == 3
+    )
+
+
+@pytest.mark.parametrize(
+    ("start_step", "grad_accum_steps", "batches_per_epoch", "expected"),
+    [
+        (0, 4, 17_777, (0, 0)),
+        (500, 4, 17_777, (0, 2_000)),
+        (4_445, 4, 17_777, (1, 3)),
+        (8_889, 4, 17_777, (2, 2)),
+    ],
+)
+def test_resolves_exact_dataloader_resume_position(
+    start_step, grad_accum_steps, batches_per_epoch, expected
+):
+    assert (
+        resolve_data_resume_position(
+            start_step=start_step,
+            grad_accum_steps=grad_accum_steps,
+            batches_per_epoch=batches_per_epoch,
+        )
+        == expected
     )

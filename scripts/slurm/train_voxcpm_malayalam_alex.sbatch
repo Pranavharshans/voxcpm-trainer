@@ -81,19 +81,35 @@ python scripts/audit_malayalam_tokenizer.py \
     --pretrained-path "${VOXCPM_PRETRAINED_PATH}" \
     --manifest "${MALAYALAM_TRAIN_MANIFEST}"
 
+TRAIN_CONFIG=${VOXCPM_TRAIN_CONFIG:-conf/voxcpm_v2/voxcpm_finetune_malayalam_lora.yaml}
+ACTIVE_CHILD_PID=""
+
+forward_term() {
+    echo "Slurm time-limit signal received; asking the active process to checkpoint and stop." >&2
+    if [[ -n "${ACTIVE_CHILD_PID}" ]]; then
+        kill -TERM "${ACTIVE_CHILD_PID}" 2>/dev/null || true
+        wait "${ACTIVE_CHILD_PID}" || true
+    fi
+}
+trap forward_term TERM INT
+
 torchrun \
     --standalone \
     --nnodes=1 \
     --nproc-per-node="${NPROC_PER_NODE}" \
     scripts/train_voxcpm_finetune.py \
-    --config_path "${VOXCPM_TRAIN_CONFIG:-conf/voxcpm_v2/voxcpm_finetune_malayalam_lora.yaml}" &
-TRAIN_PID=$!
+    --config_path "${TRAIN_CONFIG}" &
+ACTIVE_CHILD_PID=$!
 
-forward_term() {
-    echo "Slurm time-limit signal received; asking torchrun to checkpoint and stop." >&2
-    kill -TERM "${TRAIN_PID}" 2>/dev/null || true
-    wait "${TRAIN_PID}" || true
-}
-trap forward_term TERM INT
+wait "${ACTIVE_CHILD_PID}"
+ACTIVE_CHILD_PID=""
 
-wait "${TRAIN_PID}"
+# FSDP cannot safely execute VoxCPM's custom generate() path while sharded.
+# The evaluator is a no-op for non-FSDP/smoke profiles. For production FSDP,
+# it loads each portable epoch checkpoint on GPU 0 after torchrun has released
+# all sharded model state, keeping training and evaluation in one allocation.
+python scripts/evaluate_voxcpm_epoch_checkpoints.py \
+    --config-path "${TRAIN_CONFIG}" &
+ACTIVE_CHILD_PID=$!
+
+wait "${ACTIVE_CHILD_PID}"

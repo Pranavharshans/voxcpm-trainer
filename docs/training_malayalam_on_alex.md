@@ -261,29 +261,10 @@ batch of 16. On four GPUs, accumulation resolves automatically from 16 to 4.
 Periodic recovery checkpoints are written every 500 optimizer steps; only the
 newest two periodic checkpoints are retained, while epoch checkpoints remain.
 
-First run the two-step smoke configuration on four A100 40 GB GPUs. It verifies
-FSDP forward/backward, optimizer stepping, and full checkpoint consolidation:
-
-```bash
-cp "$RUNTIME/alex-sft.env" "$RUNTIME/alex-sft-fsdp-smoke.env"
-sed -i \
-  "s|^VOXCPM_RUN_DIR=.*|VOXCPM_RUN_DIR=$RUNTIME/runs/malayalam-full-sft-fsdp-smoke|" \
-  "$RUNTIME/alex-sft-fsdp-smoke.env"
-sed -i \
-  "s|^VOXCPM_TRAIN_CONFIG=.*|VOXCPM_TRAIN_CONFIG=conf/voxcpm_v2/voxcpm_finetune_malayalam_full_sft_fsdp_smoke.yaml|" \
-  "$RUNTIME/alex-sft-fsdp-smoke.env"
-
-SMOKE_JOB=$(sbatch --parsable \
-  --dependency="afterok:$SFT_PREP_JOB" \
-  --output="$VOX_STORAGE/voxcpm-sft-fsdp-smoke-%j.out" \
-  "$REPO/scripts/slurm/train_voxcpm_malayalam_fsdp_a100_40_alex.sbatch" \
-  "$RUNTIME/alex-sft-fsdp-smoke.env")
-
-echo "FSDP smoke test: $SMOKE_JOB"
-```
-
-After `sacct` reports `COMPLETED` with exit code `0:0`, create a clean
-production environment and submit the two-epoch run:
+Create a clean production environment. The production job saves a full
+checkpoint after its first optimizer step, so the first few minutes verify
+FSDP forward/backward, optimizer stepping, and checkpoint consolidation
+without requiring a second allocation for a separate smoke job:
 
 ```bash
 cp "$RUNTIME/alex-sft.env" "$RUNTIME/alex-sft-fsdp.env"
@@ -292,13 +273,24 @@ sed -i \
   "$RUNTIME/alex-sft-fsdp.env"
 
 SFT_JOB=$(sbatch --parsable \
+  --partition=a100,a40,rtxpro6k \
+  --gres=gpu:4 \
+  --cpus-per-task=64 \
+  --time=15:00:00 \
   --output="$VOX_STORAGE/voxcpm-sft-fsdp-%j.out" \
-  "$REPO/scripts/slurm/train_voxcpm_malayalam_fsdp_a100_40_alex.sbatch" \
+  "$REPO/scripts/slurm/train_voxcpm_malayalam_alex.sbatch" \
   "$RUNTIME/alex-sft-fsdp.env")
 
 echo "SFT preparation: $SFT_PREP_JOB"
 echo "SFT training: $SFT_JOB"
 ```
+
+The untyped four-GPU request lets Slurm choose A100, A40, or RTX PRO 6000.
+The job retains the same global batch of 16 on every supported GPU type.
+After distributed training exits, the same allocation loads `epoch_01` and
+`epoch_02` one at a time on GPU 0 and generates the Maya-conditioned WAV and
+TensorBoard artifacts. This avoids unsupported custom generation inside an
+FSDP forward context and does not require another queued job.
 
 Full SFT uses substantially more VRAM and writes much larger checkpoints than
 LoRA. Confirm GPU memory after startup with:

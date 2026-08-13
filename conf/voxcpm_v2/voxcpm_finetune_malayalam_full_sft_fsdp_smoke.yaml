@@ -1,0 +1,35 @@
+# Two-step smoke test for the four-GPU A100 40 GB FSDP execution path.
+pretrained_path: ${VOXCPM_PRETRAINED_PATH}
+train_manifest: ${MALAYALAM_TRAIN_MANIFEST}
+val_manifest: ${MALAYALAM_VAL_MANIFEST}
+sample_rate: 16000
+out_sample_rate: 48000
+text_normalization: NFC
+
+batch_size: 1
+grad_accum_steps: 16
+global_batch_size: 16
+num_workers: 8
+num_iters: 2
+num_epochs: 0
+log_interval: 1
+valid_interval: 0
+save_interval: 0
+validate_at_epoch_end: false
+save_at_epoch_end: false
+eval_audio_samples: 0
+save_eval_audio: false
+
+learning_rate: 0.00001
+weight_decay: 0.01
+warmup_steps: 1
+max_steps: 2
+max_batch_tokens: 6144
+max_grad_norm: 1.0
+distributed_strategy: fsdp
+activation_checkpointing: true
+save_path: ${VOXCPM_RUN_DIR}/checkpoints
+tensorboard: ${VOXCPM_RUN_DIR}/tensorboard
+lambdas:
+  loss/diff: 1.0
+  loss/stop: 1.0

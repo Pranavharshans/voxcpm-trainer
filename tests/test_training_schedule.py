@@ -16,6 +16,7 @@ assert spec.loader is not None
 spec.loader.exec_module(schedule_module)
 
 build_epoch_end_schedule = schedule_module.build_epoch_end_schedule
+resolve_grad_accum_steps = schedule_module.resolve_grad_accum_steps
 
 
 def test_builds_exact_boundaries_for_non_divisible_dataset():
@@ -40,3 +41,41 @@ def test_rejects_non_positive_schedule_values():
             world_size=1,
             num_epochs=0,
         )
+
+
+@pytest.mark.parametrize(
+    ("world_size", "expected"),
+    [(1, 16), (2, 8), (4, 4), (8, 2)],
+)
+def test_preserves_global_batch_across_supported_world_sizes(world_size, expected):
+    assert (
+        resolve_grad_accum_steps(
+            global_batch_size=16,
+            batch_size=1,
+            world_size=world_size,
+            fallback_grad_accum_steps=16,
+        )
+        == expected
+    )
+
+
+def test_rejects_world_size_that_cannot_preserve_global_batch():
+    with pytest.raises(ValueError, match="must be divisible"):
+        resolve_grad_accum_steps(
+            global_batch_size=16,
+            batch_size=1,
+            world_size=6,
+            fallback_grad_accum_steps=16,
+        )
+
+
+def test_uses_fallback_when_global_batch_is_disabled():
+    assert (
+        resolve_grad_accum_steps(
+            global_batch_size=0,
+            batch_size=2,
+            world_size=4,
+            fallback_grad_accum_steps=3,
+        )
+        == 3
+    )

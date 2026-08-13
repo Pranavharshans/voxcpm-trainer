@@ -119,7 +119,13 @@ wall time. The job runs the tokenizer audit first, launches training through
 `torchrun`, and writes `slurm-voxcpm-ml-<job-id>.out` in the submission
 directory.
 
-To request four A100 GPUs on one node, override both GPU and CPU allocations:
+The default distributed mode is DDP, which replicates the complete training
+state on every GPU. Increasing the GPU count speeds supported jobs up but does
+not make a full-SFT model fit into smaller GPUs. Use the FSDP launcher described
+in the full-parameter SFT section for A100 40 GB training.
+
+For a DDP-compatible workload such as LoRA, request four A100 GPUs by overriding
+both GPU and CPU allocations:
 
 ```bash
 sbatch --gres=gpu:a100:4 --cpus-per-task=64 \
@@ -128,8 +134,8 @@ sbatch --gres=gpu:a100:4 --cpus-per-task=64 \
 ```
 
 The effective global batch is `batch_size × grad_accum_steps × GPU count`.
-Adjust `grad_accum_steps` if changing GPU count so optimization behavior stays
-comparable.
+Configurations with `global_batch_size` resolve gradient accumulation
+automatically and reject GPU counts that cannot preserve the requested batch.
 
 Monitor with:
 
@@ -248,17 +254,47 @@ SFT_PREP_JOB=$(sbatch --parsable \
   sft)
 ```
 
-Then submit one RTX Pro 6000 with an `afterok` dependency:
+Full SFT exceeded the memory of one A100 80 GB on a long sample. The SFT
+configuration therefore enables native PyTorch FSDP `FULL_SHARD`, transformer
+activation checkpointing, a 6,144-token batch cap, and an effective global
+batch of 16. On four GPUs, accumulation resolves automatically from 16 to 4.
+Periodic recovery checkpoints are written every 500 optimizer steps; only the
+newest two periodic checkpoints are retained, while epoch checkpoints remain.
+
+First run the two-step smoke configuration on four A100 40 GB GPUs. It verifies
+FSDP forward/backward, optimizer stepping, and full checkpoint consolidation:
 
 ```bash
-SFT_JOB=$(sbatch --parsable \
-  --partition=rtxpro6k \
-  --gres=gpu:rtxpro6k:1 \
-  --cpus-per-task=16 \
+cp "$RUNTIME/alex-sft.env" "$RUNTIME/alex-sft-fsdp-smoke.env"
+sed -i \
+  "s|^VOXCPM_RUN_DIR=.*|VOXCPM_RUN_DIR=$RUNTIME/runs/malayalam-full-sft-fsdp-smoke|" \
+  "$RUNTIME/alex-sft-fsdp-smoke.env"
+sed -i \
+  "s|^VOXCPM_TRAIN_CONFIG=.*|VOXCPM_TRAIN_CONFIG=conf/voxcpm_v2/voxcpm_finetune_malayalam_full_sft_fsdp_smoke.yaml|" \
+  "$RUNTIME/alex-sft-fsdp-smoke.env"
+
+SMOKE_JOB=$(sbatch --parsable \
   --dependency="afterok:$SFT_PREP_JOB" \
-  --output="$VOX_STORAGE/voxcpm-sft-train-%j.out" \
-  "$REPO/scripts/slurm/train_voxcpm_malayalam_alex.sbatch" \
-  "$RUNTIME/alex-sft.env")
+  --output="$VOX_STORAGE/voxcpm-sft-fsdp-smoke-%j.out" \
+  "$REPO/scripts/slurm/train_voxcpm_malayalam_fsdp_a100_40_alex.sbatch" \
+  "$RUNTIME/alex-sft-fsdp-smoke.env")
+
+echo "FSDP smoke test: $SMOKE_JOB"
+```
+
+After `sacct` reports `COMPLETED` with exit code `0:0`, create a clean
+production environment and submit the two-epoch run:
+
+```bash
+cp "$RUNTIME/alex-sft.env" "$RUNTIME/alex-sft-fsdp.env"
+sed -i \
+  "s|^VOXCPM_RUN_DIR=.*|VOXCPM_RUN_DIR=$RUNTIME/runs/malayalam-full-sft-2epoch-fsdp|" \
+  "$RUNTIME/alex-sft-fsdp.env"
+
+SFT_JOB=$(sbatch --parsable \
+  --output="$VOX_STORAGE/voxcpm-sft-fsdp-%j.out" \
+  "$REPO/scripts/slurm/train_voxcpm_malayalam_fsdp_a100_40_alex.sbatch" \
+  "$RUNTIME/alex-sft-fsdp.env")
 
 echo "SFT preparation: $SFT_PREP_JOB"
 echo "SFT training: $SFT_JOB"
@@ -283,7 +319,7 @@ Slurm job ends; the persistent source model is unchanged.
 SFT outputs are kept under:
 
 ```text
-voxcpm-runtime/runs/malayalam-full-sft-2epoch/
+voxcpm-runtime/runs/malayalam-full-sft-2epoch-fsdp/
 ├── checkpoints/epoch_01/
 ├── checkpoints/epoch_02/
 ├── eval_samples/epoch_01/

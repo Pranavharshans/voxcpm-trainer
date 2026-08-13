@@ -8,9 +8,12 @@ out_sample_rate: 48000
 text_normalization: NFC
 
 # Effective global batch = batch_size * grad_accum_steps * GPU count.
+# global_batch_size automatically resolves accumulation to 16, 8, or 4 for
+# one, two, or four GPUs respectively, preserving the optimizer schedule.
 # num_iters is derived after over-length samples are filtered.
 batch_size: 1
 grad_accum_steps: 16
+global_batch_size: 16
 num_workers: 8
 num_iters: 0
 num_epochs: 2
@@ -35,6 +38,8 @@ max_steps: 0
 # 80 GB. The previous 8192-token cap reached 81,156 MiB and OOMed mid-epoch.
 max_batch_tokens: 6144
 max_grad_norm: 1.0
+distributed_strategy: fsdp
+activation_checkpointing: true
 save_path: ${VOXCPM_RUN_DIR}/checkpoints
 tensorboard: ${VOXCPM_RUN_DIR}/tensorboard
 lambdas:

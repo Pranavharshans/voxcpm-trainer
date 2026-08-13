@@ -40,7 +40,7 @@ from voxcpm.training import (
     load_audio_text_datasets,
 )
 from voxcpm.training.text import normalize_training_text
-from voxcpm.training.schedule import build_epoch_end_schedule
+from voxcpm.training.schedule import build_epoch_end_schedule, resolve_grad_accum_steps
 
 
 @argbind.bind(without_prefix=True)
@@ -52,6 +52,7 @@ def train(
     out_sample_rate: int = 0,  # AudioVAE decoder output rate; used for TensorBoard audio logging
     batch_size: int = 1,
     grad_accum_steps: int = 1,
+    global_batch_size: int = 0,
     num_workers: int = 2,
     num_iters: int = 100_000,
     num_epochs: int = 0,
@@ -79,6 +80,8 @@ def train(
     # Distribution options (for LoRA checkpoints)
     hf_model_id: str = "",  # HuggingFace model ID (e.g., "openbmb/VoxCPM1.5")
     distribute: bool = False,  # If True, save hf_model_id as base_model; otherwise save pretrained_path
+    distributed_strategy: str = "ddp",
+    activation_checkpointing: bool = False,
 ):
     _ = config_path
 
@@ -86,7 +89,20 @@ def train(
     if lora is not None and distribute and not hf_model_id:
         raise ValueError("hf_model_id is required when distribute=True")
 
-    accelerator = Accelerator(amp=True)
+    accelerator = Accelerator(
+        amp=True,
+        distributed_strategy=distributed_strategy,
+        activation_checkpointing=activation_checkpointing,
+    )
+    if str(distributed_strategy).strip().lower() == "fsdp" and accelerator.world_size < 2:
+        raise ValueError("distributed_strategy='fsdp' requires at least two torchrun processes/GPUs")
+    configured_grad_accum_steps = int(grad_accum_steps)
+    grad_accum_steps = resolve_grad_accum_steps(
+        global_batch_size=global_batch_size,
+        batch_size=batch_size,
+        world_size=accelerator.world_size,
+        fallback_grad_accum_steps=configured_grad_accum_steps,
+    )
 
     if bool(eval_prompt_audio) != bool(eval_prompt_text):
         raise ValueError("eval_prompt_audio and eval_prompt_text must either both be set or both be empty")
@@ -104,6 +120,14 @@ def train(
 
     writer = SummaryWriter(log_dir=str(tb_dir)) if accelerator.rank == 0 else None
     tracker = TrainingTracker(writer=writer, log_file=str(save_dir / "train.log"), rank=accelerator.rank)
+    if accelerator.rank == 0:
+        tracker.print(
+            f"Distributed strategy: "
+            f"{distributed_strategy if accelerator.world_size > 1 else 'single'}, "
+            f"world_size={accelerator.world_size}, batch_size={batch_size}, "
+            f"grad_accum_steps={grad_accum_steps}, "
+            f"effective_global_batch={batch_size * grad_accum_steps * accelerator.world_size}."
+        )
 
     # Auto-detect model architecture from config.json
     with open(os.path.join(pretrained_path, "config.json"), "r", encoding="utf-8") as _f:
@@ -224,8 +248,7 @@ def train(
         out_sr = out_sample_rate
     del base_model.audio_vae
     model = accelerator.prepare_model(base_model)
-    unwrapped_model = accelerator.unwrap(model)
-    unwrapped_model.train()
+    model.train()
 
     # Only print param info on rank 0 to avoid cluttered output
     if accelerator.rank == 0:
@@ -249,7 +272,7 @@ def train(
     )
 
     # All ranks load the same checkpoint to keep model and optimizer state in sync.
-    start_step = load_checkpoint(model, optimizer, scheduler, save_dir, rank=accelerator.rank)
+    start_step = load_checkpoint(model, optimizer, scheduler, save_dir, accelerator=accelerator)
     accelerator.barrier()
 
     if start_step > 0 and accelerator.rank == 0:
@@ -276,13 +299,27 @@ def train(
             cur_step = int(_resume.get("step", start_step))
         except Exception:
             cur_step = start_step
+        should_checkpoint = accelerator.is_fsdp or _rank == 0
         if _rank == 0:
             print(f"Signal {signum} received. Saving checkpoint at step {cur_step} ...", file=sys.stderr)
+        if should_checkpoint:
             try:
-                save_checkpoint(_model, _optim, _sched, _save_dir, cur_step, _pretrained, _hf_id, _dist)
-                print("Checkpoint saved. Exiting.", file=sys.stderr)
+                save_checkpoint(
+                    _model,
+                    _optim,
+                    _sched,
+                    _save_dir,
+                    cur_step,
+                    _pretrained,
+                    _hf_id,
+                    _dist,
+                    accelerator=accelerator,
+                )
+                if _rank == 0:
+                    print("Checkpoint saved. Exiting.", file=sys.stderr)
             except Exception as e:
-                print(f"Error saving checkpoint on signal: {e}", file=sys.stderr)
+                if _rank == 0:
+                    print(f"Error saving checkpoint on signal: {e}", file=sys.stderr)
         os._exit(0)
 
     signal.signal(signal.SIGTERM, _signal_handler)
@@ -356,7 +393,7 @@ def train(
             if scaler is not None:
                 scaler.unscale_(optimizer)
             effective_max_norm = max_grad_norm if max_grad_norm > 0 else 1e9
-            grad_norm = torch.nn.utils.clip_grad_norm_(unwrapped_model.parameters(), max_norm=effective_max_norm)
+            grad_norm = accelerator.clip_grad_norm_(model, max_norm=effective_max_norm)
 
             accelerator.step(optimizer)
             accelerator.update()
@@ -402,7 +439,7 @@ def train(
 
             interval_save = save_interval > 0 and step % save_interval == 0
             epoch_save = save_at_epoch_end and completed_epoch is not None
-            if (interval_save or epoch_save or step == num_iters - 1) and accelerator.rank == 0:
+            if interval_save or epoch_save or step == num_iters - 1:
                 checkpoint_tag = f"epoch_{completed_epoch:02d}" if completed_epoch is not None else None
                 save_checkpoint(
                     model,
@@ -415,10 +452,11 @@ def train(
                     distribute,
                     tag=checkpoint_tag,
                     resume_step=step + 1,
+                    accelerator=accelerator,
                 )
                 last_saved_step = step
 
-    if accelerator.rank == 0 and last_saved_step != num_iters - 1:
+    if last_saved_step != num_iters - 1:
         save_checkpoint(
             model,
             optimizer,
@@ -429,6 +467,7 @@ def train(
             hf_model_id,
             distribute,
             resume_step=num_iters,
+            accelerator=accelerator,
         )
     if writer:
         writer.close()
@@ -506,36 +545,44 @@ def validate(
 
         tracker.log_metrics(val_metrics, split="val")
 
-    # Generate sample audio for TensorBoard display
-    if writer is not None and val_ds is not None and audio_vae is not None and accelerator.rank == 0:
+    # FSDP's nested wrappers use collectives during forward, so every rank
+    # participates in deterministic sample generation. Only rank zero writes
+    # TensorBoard/WAV artifacts.
+    should_generate = val_ds is not None and audio_vae is not None and (writer is not None or accelerator.is_fsdp)
+    if should_generate:
         try:
-            generate_sample_audio(
-                model,
-                val_ds,
-                audio_vae,
-                writer,
-                step,
-                accelerator,
-                sample_rate,
-                out_sample_rate=out_sample_rate,
-                val_texts=val_texts,
-                tokenizer=tokenizer,
-                valid_interval=valid_interval,
-                tracker=tracker,
-                num_samples=num_audio_samples,
-                audio_output_dir=audio_output_dir,
-                audio_label=audio_label,
-                prompt_audio_path=prompt_audio_path,
-                prompt_text=prompt_text,
-            )
+            with accelerator.summon_full_params(model) as generation_model:
+                generate_sample_audio(
+                    generation_model,
+                    val_ds,
+                    audio_vae,
+                    writer,
+                    step,
+                    accelerator,
+                    sample_rate,
+                    out_sample_rate=out_sample_rate,
+                    val_texts=val_texts,
+                    tokenizer=tokenizer,
+                    valid_interval=valid_interval,
+                    tracker=tracker if accelerator.rank == 0 else None,
+                    num_samples=num_audio_samples,
+                    audio_output_dir=audio_output_dir if accelerator.rank == 0 else None,
+                    audio_label=audio_label,
+                    prompt_audio_path=prompt_audio_path,
+                    prompt_text=prompt_text,
+                    write_outputs=accelerator.rank == 0,
+                )
+            accelerator.barrier()
         except Exception as e:
-            tracker.print(f"[Warning] Failed to generate sample audio: {e}")
+            if accelerator.rank == 0:
+                tracker.print(f"[Warning] Failed to generate sample audio: {e}")
             import traceback
             import io
 
             buf = io.StringIO()
             traceback.print_exc(file=buf)
-            tracker.print(buf.getvalue())
+            if accelerator.rank == 0:
+                tracker.print(buf.getvalue())
     else:
         # Log why audio generation was skipped
         missing = []
@@ -636,12 +683,13 @@ def generate_sample_audio(
     audio_label=None,
     prompt_audio_path=None,
     prompt_text=None,
+    write_outputs=True,
 ):
     """Generate fixed validation samples for TensorBoard and optional WAV files."""
     import numpy as np
     import soundfile as sf
 
-    log = tracker.print if tracker else print
+    log = tracker.print if tracker else (lambda *_args, **_kwargs: None)
     num_samples = min(max(int(num_samples), 0), len(val_ds))
     log(f"[Audio] Starting audio generation for {num_samples} samples at step {step}")
 
@@ -731,7 +779,8 @@ def generate_sample_audio(
             gen_audio_np = normalize_audio(gen_audio_np)
 
             tag = f"val_sample_{i}"
-            writer.add_audio(f"{tag}/generated_audio", gen_audio_np, global_step=step, sample_rate=gen_sr)
+            if write_outputs and writer is not None:
+                writer.add_audio(f"{tag}/generated_audio", gen_audio_np, global_step=step, sample_rate=gen_sr)
             log(f"[Audio] Generated audio for sample {i}: duration={len(gen_audio_np)/gen_sr:.2f}s")
 
             if output_folder is not None:
@@ -742,9 +791,13 @@ def generate_sample_audio(
 
             # Log reference audio (at encoder input rate, which is what val_ds provides)
             if ref_audio_np is not None:
-                writer.add_audio(
-                    f"{tag}/reference_audio", normalize_audio(ref_audio_np), global_step=step, sample_rate=sample_rate
-                )
+                if write_outputs and writer is not None:
+                    writer.add_audio(
+                        f"{tag}/reference_audio",
+                        normalize_audio(ref_audio_np),
+                        global_step=step,
+                        sample_rate=sample_rate,
+                    )
                 if output_folder is not None:
                     reference_path = output_folder / f"sample_{i}_reference.wav"
                     sf.write(reference_path, normalize_audio(ref_audio_np), sample_rate, subtype="PCM_16")
@@ -754,7 +807,8 @@ def generate_sample_audio(
                 mel_gen = compute_mel_spectrogram(gen_audio_np, gen_sr)
                 mel_ref = compute_mel_spectrogram(ref_audio_np, sample_rate) if ref_audio_np is not None else None
                 fig = create_mel_figure(gen_audio_np, mel_gen, gen_sr, step, ref_audio_np, mel_ref)
-                writer.add_figure(f"{tag}/mel_spectrogram", fig, global_step=step)
+                if write_outputs and writer is not None:
+                    writer.add_figure(f"{tag}/mel_spectrogram", fig, global_step=step)
                 log(f"[Audio] Created mel spectrogram figure for sample {i}")
             except Exception as e:
                 log(f"[Warning] Failed to create mel spectrogram: {e}")
@@ -778,7 +832,7 @@ def generate_sample_audio(
                 log(f"[Warning] Failed to restore model state: {e}")
 
 
-def load_checkpoint(model, optimizer, scheduler, save_dir: Path, rank: int = 0):
+def load_checkpoint(model, optimizer, scheduler, save_dir: Path, accelerator):
     """
     Load the latest checkpoint if it exists.
     Called by all ranks so that distributed state stays aligned.
@@ -788,7 +842,8 @@ def load_checkpoint(model, optimizer, scheduler, save_dir: Path, rank: int = 0):
     if not latest_folder.exists():
         return 0
 
-    unwrapped = model.module if hasattr(model, "module") else model
+    rank = accelerator.rank
+    unwrapped = accelerator.unwrap(model)
     lora_cfg = unwrapped.lora_config
 
     # Load model weights
@@ -825,14 +880,30 @@ def load_checkpoint(model, optimizer, scheduler, save_dir: Path, rank: int = 0):
                 ckpt = torch.load(model_path, map_location="cpu", weights_only=True)
                 state_dict = ckpt.get("state_dict", ckpt)
 
-            unwrapped.load_state_dict(state_dict, strict=False)
+            if accelerator.is_fsdp:
+                from torch.distributed.fsdp import FullStateDictConfig, FullyShardedDataParallel as FSDP
+                from torch.distributed.fsdp import StateDictType
+
+                with FSDP.state_dict_type(
+                    model,
+                    StateDictType.FULL_STATE_DICT,
+                    FullStateDictConfig(offload_to_cpu=True, rank0_only=False),
+                ):
+                    model.load_state_dict(state_dict, strict=False)
+            else:
+                unwrapped.load_state_dict(state_dict, strict=False)
             if rank == 0:
                 print(f"Loaded model weights from {model_path}", file=sys.stderr)
 
     # Load optimizer state
     optimizer_path = latest_folder / "optimizer.pth"
     if optimizer_path.exists():
-        optimizer.load_state_dict(torch.load(optimizer_path, map_location="cpu", weights_only=True))
+        optimizer_state = torch.load(optimizer_path, map_location="cpu", weights_only=True)
+        if accelerator.is_fsdp:
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+            optimizer_state = FSDP.optim_state_dict_to_load(model, optimizer, optimizer_state)
+        optimizer.load_state_dict(optimizer_state)
         if rank == 0:
             print(f"Loaded optimizer state from {optimizer_path}", file=sys.stderr)
 
@@ -875,6 +946,7 @@ def save_checkpoint(
     distribute: bool = False,
     tag: str = None,
     resume_step: int = None,
+    accelerator=None,
 ):
     """
     Save checkpoint with different strategies for full finetune vs LoRA:
@@ -883,14 +955,44 @@ def save_checkpoint(
     """
     import shutil
 
+    if accelerator is None:
+        raise ValueError("save_checkpoint requires an Accelerator")
+
+    rank = accelerator.rank
+    is_fsdp = accelerator.is_fsdp
+    if not is_fsdp and rank != 0:
+        return
+
     save_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_tag = tag or f"step_{step:07d}"
     folder = save_dir / checkpoint_tag
     folder.mkdir(parents=True, exist_ok=True)
 
-    unwrapped = model.module if hasattr(model, "module") else model
-    full_state = unwrapped.state_dict()
+    unwrapped = accelerator.unwrap(model)
     lora_cfg = unwrapped.lora_config
+
+    if is_fsdp:
+        from torch.distributed.fsdp import (
+            FullOptimStateDictConfig,
+            FullStateDictConfig,
+            FullyShardedDataParallel as FSDP,
+            StateDictType,
+        )
+
+        with FSDP.state_dict_type(
+            model,
+            StateDictType.FULL_STATE_DICT,
+            FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
+            FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True),
+        ):
+            full_state = model.state_dict()
+            optimizer_state = FSDP.optim_state_dict(model, optimizer)
+        if rank != 0:
+            accelerator.barrier()
+            return
+    else:
+        full_state = unwrapped.state_dict()
+        optimizer_state = optimizer.state_dict()
 
     if lora_cfg is not None:
         # LoRA finetune: save only lora_A/lora_B weights
@@ -933,19 +1035,34 @@ def save_checkpoint(
                 if src.exists():
                     shutil.copy2(src, folder / fname)
 
-    torch.save(optimizer.state_dict(), folder / "optimizer.pth")
+    torch.save(optimizer_state, folder / "optimizer.pth")
     torch.save(scheduler.state_dict(), folder / "scheduler.pth")
     with open(folder / "training_state.json", "w", encoding="utf-8") as f:
         json.dump({"step": int(resume_step if resume_step is not None else step)}, f)
 
-    # Update (or create) a `latest` folder by copying the most recent checkpoint
+    # Point `latest` at the most recent checkpoint without duplicating the
+    # multi-gigabyte full-SFT model and Adam optimizer state.
     latest_link = save_dir / "latest"
     try:
-        if latest_link.exists():
+        if latest_link.is_symlink():
+            latest_link.unlink()
+        elif latest_link.exists():
             shutil.rmtree(latest_link)
-        shutil.copytree(folder, latest_link)
+        latest_link.symlink_to(folder.name, target_is_directory=True)
+
+        # Recovery checkpoints contain a full model and optimizer. Retain the
+        # newest two periodic checkpoints while preserving epoch_* artifacts.
+        step_folders = sorted(
+            (path for path in save_dir.iterdir() if path.is_dir() and path.name.startswith("step_")),
+            key=lambda path: path.name,
+        )
+        for stale_folder in step_folders[:-2]:
+            shutil.rmtree(stale_folder)
     except Exception:
         print(f"Warning: failed to update latest checkpoint at {latest_link}", file=sys.stderr)
+
+    if is_fsdp:
+        accelerator.barrier()
 
 
 if __name__ == "__main__":

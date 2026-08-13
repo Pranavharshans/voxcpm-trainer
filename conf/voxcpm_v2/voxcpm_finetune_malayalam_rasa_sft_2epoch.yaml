@@ -1,0 +1,41 @@
+# Controlled full-parameter SFT on ai4bharat/Rasa's Malayalam-only config.
+pretrained_path: ${VOXCPM_PRETRAINED_PATH}
+train_manifest: ${MALAYALAM_TRAIN_MANIFEST}
+val_manifest: ${MALAYALAM_VAL_MANIFEST}
+sample_rate: 16000
+out_sample_rate: 48000
+text_normalization: NFC
+
+batch_size: 1
+grad_accum_steps: 16
+global_batch_size: 16
+num_workers: 8
+num_iters: 0
+num_epochs: 2
+log_interval: 10
+valid_interval: 0
+save_interval: 500
+validate_at_epoch_end: true
+save_at_epoch_end: true
+eval_audio_samples: 4
+save_eval_audio: true
+# Use a native Malayalam Rasa prompt so English voice conditioning does not
+# confound pronunciation and accent judgments.
+eval_prompt_audio: ${MALAYALAM_EVAL_PROMPT_AUDIO}
+eval_prompt_text: ${MALAYALAM_EVAL_PROMPT_TEXT}
+
+learning_rate: 0.00001
+weight_decay: 0.01
+warmup_steps: 800
+max_steps: 0
+max_batch_tokens: 6144
+max_grad_norm: 1.0
+distributed_strategy: fsdp
+activation_checkpointing: true
+save_path: ${VOXCPM_RUN_DIR}/checkpoints
+tensorboard: ${VOXCPM_RUN_DIR}/tensorboard
+lambdas:
+  loss/diff: 1.0
+  loss/stop: 1.0
+
+# Deliberately no `lora` section: this is a clean base-to-Rasa full SFT run.

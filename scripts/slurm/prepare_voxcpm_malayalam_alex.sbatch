@@ -10,8 +10,8 @@
 set -euo pipefail
 unset SLURM_EXPORT_ENV
 
-REPO_DIR=${1:?"usage: sbatch prepare_voxcpm_malayalam_alex.sbatch REPO_DIR RUNTIME_ROOT [pilot|full|sft|rasa-sft]"}
-RUNTIME_ROOT=${2:?"usage: sbatch prepare_voxcpm_malayalam_alex.sbatch REPO_DIR RUNTIME_ROOT [pilot|full|sft|rasa-sft]"}
+REPO_DIR=${1:?"usage: sbatch prepare_voxcpm_malayalam_alex.sbatch REPO_DIR RUNTIME_ROOT [pilot|full|sft|rasa-sft|rasa-lora]"}
+RUNTIME_ROOT=${2:?"usage: sbatch prepare_voxcpm_malayalam_alex.sbatch REPO_DIR RUNTIME_ROOT [pilot|full|sft|rasa-sft|rasa-lora]"}
 PROFILE=${3:-pilot}
 
 REPO_DIR=$(realpath "${REPO_DIR}")
@@ -57,8 +57,17 @@ case "${PROFILE}" in
         PREP_SCRIPT=scripts/prepare_rasa_malayalam.py
         STAGE_MODEL_TO_TMPDIR=1
         ;;
+    rasa-lora)
+        DATA_DIR=${RUNTIME_ROOT}/datasets/rasa-malayalam
+        RUN_DIR=${RUNTIME_ROOT}/runs/malayalam-rasa-lora-2epoch
+        JOB_ENV=${RUNTIME_ROOT}/alex-rasa-lora.env
+        TRAIN_CONFIG=conf/voxcpm_v2/voxcpm_finetune_malayalam_rasa_lora_2epoch.yaml
+        DATASET_ARGS=()
+        PREP_SCRIPT=scripts/prepare_rasa_malayalam.py
+        STAGE_MODEL_TO_TMPDIR=1
+        ;;
     *)
-        echo "Unknown profile '${PROFILE}'; expected pilot, full, sft, or rasa-sft" >&2
+        echo "Unknown profile '${PROFILE}'; expected pilot, full, sft, rasa-sft, or rasa-lora" >&2
         exit 2
         ;;
 esac
@@ -82,7 +91,7 @@ if [[ ! -x "${CONDA_ENV}/bin/python" ]]; then
 fi
 conda activate "${CONDA_ENV}"
 
-if [[ "${PROFILE}" == "rasa-sft" ]]; then
+if [[ "${PROFILE}" == "rasa-sft" || "${PROFILE}" == "rasa-lora" ]]; then
     # `hf auth login` stores the token in the user's persistent HF home. Copy
     # it into the process environment before redirecting HF caches to TMPDIR.
     PERSISTENT_HF_HOME=${PERSISTENT_HF_HOME:-${HOME}/.cache/huggingface}
@@ -132,7 +141,7 @@ VOXCPM_STAGE_MODEL_TO_TMPDIR=${STAGE_MODEL_TO_TMPDIR}
 HF_HOME=${RUNTIME_ROOT}/huggingface-cache
 EOF
 
-if [[ "${PROFILE}" == "rasa-sft" ]]; then
+if [[ "${PROFILE}" == "rasa-sft" || "${PROFILE}" == "rasa-lora" ]]; then
     printf 'MALAYALAM_EVAL_PROMPT_AUDIO=%q\n' "${DATA_DIR}/eval_prompt.flac" >> "${JOB_ENV}"
     printf 'MALAYALAM_EVAL_PROMPT_TEXT=%q\n' "$(<"${DATA_DIR}/eval_prompt.txt")" >> "${JOB_ENV}"
 fi
